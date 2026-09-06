@@ -1,8 +1,11 @@
-"""Tkinter UI: Home tab (capture -> OCR -> previous record -> save state) and Records tab."""
+"""Tkinter UI: Home tab (capture -> OCR -> previous record -> save state), Records tab and, when the
+reading log is on (running from source), a Readings tab to review captures and fix misreads."""
 from __future__ import annotations
 
 import json
+import os
 import queue
+import subprocess
 import sys
 import threading
 import time
@@ -13,7 +16,7 @@ from tkinter import filedialog, messagebox, ttk
 import numpy as np
 from PIL import Image, ImageTk
 
-from . import __version__, capture, export, ocr
+from . import __version__, capture, export, ocr, readings
 from .db import STATES, Database, name_key
 
 STATE_LABELS = {"trading": "TRADING", "fighting": "FIGHTING", "afk": "AFK", "fake": "FAKE"}
@@ -21,6 +24,7 @@ STATE_COLORS = {"trading": "#2e7d32", "fighting": "#c62828", "afk": "#616161", "
 STATE_FG = {"trading": "white", "fighting": "white", "afk": "white", "fake": "#212121"}  # button text
 STATE_PALE = {"trading": "#e8f5e9", "fighting": "#ffebee", "afk": "#eeeeee", "fake": "#fff8e1"}
 PREVIEW_MAX = (520, 140)
+READING_PREVIEW_MAX = (620, 160)
 
 
 def _fingerprint(img: Image.Image) -> np.ndarray:
@@ -75,6 +79,9 @@ class App(tk.Tk):
             pass
 
         self.db = Database()
+        # Running from source: keep every capture a name was read from, so misreads can be
+        # inspected and repaired later (Readings tab). Off in the packaged exe unless forced on.
+        self.log: readings.ReadingLog | None = readings.ReadingLog(self.db) if readings.enabled() else None
         self.engine: ocr.OcrEngine | None = None
         self._engine_lock = threading.Lock()
         self.region: capture.Region | None = self._load_region()
@@ -95,6 +102,10 @@ class App(tk.Tk):
         self.records = RecordsTab(self.nb, self)
         self.nb.add(self.home, text="   Home   ")
         self.nb.add(self.records, text="   Records   ")
+        self.readings_tab: ReadingsTab | None = None
+        if self.log is not None:
+            self.readings_tab = ReadingsTab(self.nb, self)
+            self.nb.add(self.readings_tab, text="   Readings   ")
         self.nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
         ttk.Label(self, textvariable=self.status, anchor="w", relief="sunken", padding=(6, 3)).pack(
             fill="x", side="bottom"
@@ -131,8 +142,11 @@ class App(tk.Tk):
         self.status.set(text)
 
     def _on_tab_changed(self, _e: tk.Event) -> None:
-        if self.nb.index("current") == 1:
+        tab = self.nb.nametowidget(self.nb.select())
+        if tab is self.records:
             self.records.refresh()
+        elif tab is self.readings_tab:
+            self.readings_tab.refresh()
 
     def _load_region(self) -> capture.Region | None:
         raw = self.db.get_setting("region")
@@ -180,6 +194,7 @@ class HomeTab(ttk.Frame):
         self._candidate = ""            # name seen once, waiting for a confirming read
         self._last_fp: np.ndarray | None = None
         self._last_result: tuple | None = None
+        self.reading_id: int | None = None  # log row of the capture the current name came from
         self._auto_var = tk.BooleanVar(value=app.db.get_setting("auto_read", "1") == "1")
         try:
             interval = float(app.db.get_setting("auto_interval", "1.0") or 1.0)
@@ -325,7 +340,7 @@ class HomeTab(ttk.Frame):
             try:
                 engine = self.app.get_engine(engine_name)
                 name, conf, lines, _ = ocr.read_name(img, engine, cfg)
-                self._results.put(("ok", engine.name, name, conf, lines))
+                self._results.put(("ok", engine.name, name, conf, lines, img))
             except Exception as exc:  # noqa: BLE001
                 self._results.put(("error", exc))
 
@@ -347,7 +362,8 @@ class HomeTab(ttk.Frame):
         else:
             self._on_ocr_done(*item[1:])
 
-    def _on_ocr_done(self, engine_name: str, name: str, conf: float, lines: list[ocr.OcrLine]) -> None:
+    def _on_ocr_done(self, engine_name: str, name: str, conf: float, lines: list[ocr.OcrLine], img) -> None:
+        self._log_reading(img, engine_name, name, conf, lines, "manual")  # manual reads are always kept
         if not name:
             self.ocr_info.set(f"[{engine_name}] no text found")
             self.app.set_status("OCR found no text. Check the region with 'Test capture'.")
@@ -366,6 +382,18 @@ class HomeTab(ttk.Frame):
     @staticmethod
     def _alts(lines: list[ocr.OcrLine]) -> str:
         return "  |  ".join(f"{l.text} ({l.confidence:.2f})" for l in lines[:4])
+
+    def _log_reading(self, img, engine_name: str, name: str, conf: float, lines: list[ocr.OcrLine], source: str) -> None:
+        """Remember this capture as the origin of the name now in the box (no-op when the log is off)."""
+        if self.app.log is None or img is None:
+            return
+        try:
+            self.reading_id = self.app.log.add(
+                img, engine=engine_name, name=name, conf=conf, lines=lines,
+                region=self.app.region, cfg=self.app.pre_cfg, source=source,
+            )
+        except Exception as exc:  # noqa: BLE001 - a debugging aid must never break a read
+            print(f"reading log failed: {exc}", file=sys.stderr)
 
     # --------------------------------------------------------------- auto-read
     def _set_auto(self, on: bool) -> None:
@@ -431,8 +459,8 @@ class HomeTab(ttk.Frame):
         self._show_preview(img)
         self._start_ocr(img, auto=True)
 
-    def _apply_auto_result(self, engine_name: str, name: str, conf: float, lines: list[ocr.OcrLine]) -> None:
-        self._last_result = (engine_name, name, conf, lines)
+    def _apply_auto_result(self, engine_name: str, name: str, conf: float, lines: list[ocr.OcrLine], img) -> None:
+        self._last_result = (engine_name, name, conf, lines, img)
         stamp = time.strftime("%H:%M:%S")
         if not name:
             self.auto_status.set(f"{stamp}  nothing readable")
@@ -449,6 +477,7 @@ class HomeTab(ttk.Frame):
             self.auto_status.set(f"{stamp}  saw '{name}' (paused while you type)")
             return
         self._candidate = ""
+        self._log_reading(img, engine_name, name, conf, lines, "auto")  # only the read that switched the name
         self.name_var.set(name)
         self.lookup()
         self.ocr_info.set(f"[{engine_name}] " + self._alts(lines))
@@ -456,6 +485,12 @@ class HomeTab(ttk.Frame):
         self.app.set_status(f"Auto-read '{name}' ({conf:.0%}).")
 
     # ----------------------------------------------------------------- records
+    def set_name(self, name: str) -> None:
+        """Put a name in the box that did not come from the last capture (Records / Readings tab)."""
+        self.reading_id = None
+        self.name_var.set(name)
+        self.lookup()
+
     def lookup(self) -> None:
         name = self.name_var.get().strip()
         rec = self.app.db.get(name) if name else None
@@ -490,6 +525,8 @@ class HomeTab(ttk.Frame):
             return
         prev = self.app.db.get(name)
         rec = self.app.db.upsert(name, state)
+        if self.app.log is not None and self.reading_id is not None:
+            self.app.db.mark_reading_saved(self.reading_id, rec["name"], state)
         self._show_prev(rec, name)
         if prev is not None and prev["state"] != state:
             self.app.set_status(
@@ -634,8 +671,7 @@ class RecordsTab(ttk.Frame):
         names = self._selected_names()
         if not names:
             return
-        self.app.home.name_var.set(names[0])
-        self.app.home.lookup()
+        self.app.home.set_name(names[0])
         self.app.nb.select(0)
 
     def set_selected_state(self, state: str) -> None:
@@ -656,6 +692,253 @@ class RecordsTab(ttk.Frame):
             self.app.db.delete(n)
         self.refresh()
         self.app.set_status(f"Deleted {len(names)} record(s).")
+
+
+# ======================================================================== Readings
+class ReadingsTab(ttk.Frame):
+    """Every capture the app took a name from (running from source only). Pick one, look at the
+    image, and either confirm the read or type the right name: the fix is stored on the reading
+    and, if a state was saved from it, the record is renamed (or merged into the correct one)."""
+
+    def __init__(self, master: tk.Misc, app: App) -> None:
+        super().__init__(master, padding=10)
+        self.app = app
+        self._img: ImageTk.PhotoImage | None = None
+        self._build()
+        self.refresh()
+
+    def _build(self) -> None:
+        ttk.Label(
+            self, foreground="#666", wraplength=620, justify="left",
+            text="Captures behind every name the app read (kept because you run from source). Select a row to "
+                 "see the image; type the real name and click Fix to correct it - a record saved under the "
+                 "misread is renamed too.",
+        ).pack(anchor="w", pady=(0, 6))
+        top = ttk.Frame(self)
+        top.pack(fill="x")
+        ttk.Label(top, text="Search:").pack(side="left")
+        self.search_var = tk.StringVar()
+        self.search_var.trace_add("write", lambda *_: self.refresh())
+        ttk.Entry(top, textvariable=self.search_var).pack(side="left", fill="x", expand=True, padx=6)
+        self.filter_var = tk.StringVar(value="all")
+        combo = ttk.Combobox(top, textvariable=self.filter_var, state="readonly", width=10,
+                             values=("all", "saved", "unchecked", "fixed"))
+        combo.pack(side="left")
+        combo.bind("<<ComboboxSelected>>", lambda _e: self.refresh())
+
+        self.count_var = tk.StringVar()
+        ttk.Label(self, textvariable=self.count_var, foreground="#666").pack(anchor="w", pady=(6, 2))
+
+        table = ttk.Frame(self)
+        table.pack(fill="both", expand=True)
+        cols = ("time", "read", "conf", "src", "saved", "state", "check")
+        self.tree = ttk.Treeview(table, columns=cols, show="headings", selectmode="extended", height=9)
+        for col, text, width, anchor in (
+            ("time", "Time", 125, "w"),
+            ("read", "Read as", 170, "w"),
+            ("conf", "Conf", 50, "center"),
+            ("src", "Via", 55, "center"),
+            ("saved", "Saved as", 150, "w"),
+            ("state", "State", 75, "center"),
+            ("check", "Check", 150, "w"),
+        ):
+            self.tree.heading(col, text=text)
+            self.tree.column(col, width=width, anchor=anchor, stretch=col in ("read", "saved", "check"))
+        self.tree.tag_configure("fixed", foreground="#c62828")
+        self.tree.tag_configure("ok", foreground="#2e7d32")
+        self.tree.tag_configure("empty", foreground="#9e9e9e")
+        sb = ttk.Scrollbar(table, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self.tree.bind("<<TreeviewSelect>>", self._on_select)
+        self.tree.bind("<Delete>", self.delete_selected)
+
+        self.preview = ttk.Label(self, anchor="center", relief="groove", text="(select a reading)")
+        self.preview.pack(fill="x", pady=(8, 2), ipady=6)
+        self.detail_var = tk.StringVar()
+        ttk.Label(self, textvariable=self.detail_var, foreground="#666", wraplength=620, justify="left").pack(anchor="w")
+
+        row = ttk.Frame(self)
+        row.pack(fill="x", pady=(8, 0))
+        ttk.Label(row, text="Correct name:").pack(side="left")
+        self.fix_var = tk.StringVar()
+        entry = ttk.Entry(row, textvariable=self.fix_var, font=("", 11))
+        entry.pack(side="left", fill="x", expand=True, padx=6)
+        entry.bind("<Return>", lambda _e: self.fix_selected())
+        tk.Button(row, text="Fix", font=("", 10, "bold"), bg="#1565c0", fg="white",
+                  activebackground="#0d47a1", activeforeground="white", padx=12,
+                  command=self.fix_selected).pack(side="left")
+        ttk.Button(row, text="Read was right", command=self.confirm_selected).pack(side="left", padx=(6, 0))
+
+        tools = ttk.Frame(self)
+        tools.pack(fill="x", pady=(6, 0))
+        ttk.Button(tools, text="Load into Home", command=self.load_selected).pack(side="left")
+        ttk.Button(tools, text="Open folder", command=self.open_folder).pack(side="left", padx=(6, 0))
+        ttk.Button(tools, text="Delete", command=self.delete_selected).pack(side="right")
+        ttk.Button(tools, text="Refresh", command=self.refresh).pack(side="right", padx=(0, 6))
+
+    # ------------------------------------------------------------------- table
+    @staticmethod
+    def _is_fixed(r) -> bool:
+        """True when a human changed the name (as opposed to confirming or not checking it)."""
+        return bool(r["fixed_name"]) and r["fixed_name"].lower() != (r["read_name"] or "").lower()
+
+    def refresh(self) -> None:
+        rows = self.app.db.readings(self.search_var.get().strip())
+        f = self.filter_var.get()
+        if f == "saved":
+            rows = [r for r in rows if r["saved_name"]]
+        elif f == "unchecked":
+            rows = [r for r in rows if not r["fixed_name"]]
+        elif f == "fixed":
+            rows = [r for r in rows if self._is_fixed(r)]
+        selected = set(self.tree.selection())
+        self.tree.delete(*self.tree.get_children())
+        for r in rows:
+            if not r["fixed_name"]:
+                check, tags = "", (("empty",) if not r["read_name"] else ())
+            elif self._is_fixed(r):
+                check, tags = f"-> {r['fixed_name']}", ("fixed",)
+            else:
+                check, tags = "ok", ("ok",)
+            self.tree.insert(
+                "", "end", iid=str(r["id"]),
+                values=(r["ts"], r["read_name"] or "(nothing readable)", f"{r['confidence']:.2f}", r["source"],
+                        r["saved_name"], STATE_LABELS.get(r["saved_state"], ""), check),
+                tags=tags,
+            )
+        keep = [str(r["id"]) for r in rows if str(r["id"]) in selected]
+        if keep:
+            self.tree.selection_set(keep)
+        else:
+            self._show(None)
+        n_saved = sum(1 for r in rows if r["saved_name"])
+        n_fixed = sum(1 for r in rows if self._is_fixed(r))
+        self.count_var.set(f"{len(rows)} readings shown   ({n_saved} led to a saved state, {n_fixed} fixed)   "
+                           f"folder: {self.app.log.dir}")
+
+    def _selected_ids(self) -> list[int]:
+        return [int(i) for i in self.tree.selection()]
+
+    def _on_select(self, _e=None) -> None:
+        ids = self._selected_ids()
+        self._show(self.app.db.reading(ids[0]) if ids else None)
+
+    def _show(self, r) -> None:
+        if r is None:
+            self.preview.configure(image="", text="(select a reading)")
+            self._img = None
+            self.detail_var.set("")
+            self.fix_var.set("")
+            return
+        img = self.app.log.image(r)
+        if img is None:
+            self.preview.configure(image="", text="(image missing)")
+            self._img = None
+        else:
+            im = img.copy()
+            if im.width * 2 <= READING_PREVIEW_MAX[0] and im.height * 2 <= READING_PREVIEW_MAX[1]:
+                im = im.resize((im.width * 2, im.height * 2), Image.NEAREST)  # small crops: show 2x
+            im.thumbnail(READING_PREVIEW_MAX)
+            self._img = ImageTk.PhotoImage(im)
+            self.preview.configure(image=self._img, text="")
+        try:
+            alts = json.loads(r["alternatives"] or "[]")
+        except ValueError:
+            alts = []
+        alt_text = "  |  ".join(f"{t} ({c:.2f})" for t, c in alts) or "-"
+        fixed = f"   fixed {r['fixed_at']}" if r["fixed_name"] else ""
+        self.detail_var.set(f"[{r['engine']}] rows: {alt_text}\nregion {r['region'] or '-'}   {r['image']}{fixed}")
+        self.fix_var.set(r["fixed_name"] or r["read_name"])
+
+    # ----------------------------------------------------------------- actions
+    def confirm_selected(self) -> None:
+        ids = self._selected_ids()
+        for rid in ids:
+            r = self.app.db.reading(rid)
+            if r is not None and r["read_name"]:
+                self.app.db.fix_reading(rid, r["read_name"])
+        self.refresh()
+        if ids:
+            self.app.set_status(f"Marked {len(ids)} reading(s) as read correctly.")
+
+    def fix_selected(self) -> None:
+        ids = self._selected_ids()
+        new = " ".join(self.fix_var.get().split())
+        if not ids:
+            messagebox.showinfo("Fix reading", "Select the reading(s) to fix first.")
+            return
+        if not new:
+            messagebox.showinfo("Fix reading", "Type the correct name first.")
+            return
+        # Records saved under the misread: repair each distinct one once, after asking.
+        wrong_names: list[str] = []
+        for rid in ids:
+            r = self.app.db.reading(rid)
+            if r is not None and r["saved_name"] and r["saved_name"].lower() != new.lower():
+                if r["saved_name"].lower() not in {w.lower() for w in wrong_names}:
+                    wrong_names.append(r["saved_name"])
+        results = []
+        for old in wrong_names:
+            src = self.app.db.get(old, loose=False)
+            if src is None:
+                continue  # already renamed or deleted; nothing left to repair
+            dst = self.app.db.get(new)
+            if dst is not None and dst["id"] != src["id"]:
+                what = (f"'{new}' already has a record ({STATE_LABELS[dst['state']]}, seen {dst['times_seen']}x).\n\n"
+                        f"Merge '{src['name']}' ({STATE_LABELS[src['state']]}, seen {src['times_seen']}x) into it?")
+            else:
+                what = f"Rename the record '{src['name']}' ({STATE_LABELS[src['state']]}, seen {src['times_seen']}x) to '{new}'?"
+            if not messagebox.askyesno("Fix record", what, parent=self):
+                continue
+            try:
+                results.append(self.app.db.rename_record(src["name"], new))
+            except (ValueError, LookupError) as exc:
+                messagebox.showerror("Fix record", str(exc), parent=self)
+        for rid in ids:
+            self.app.db.fix_reading(rid, new)
+        self.refresh()
+        self.app.records.refresh()
+        if results and self.app.home.name_var.get().strip().lower() in {r["old"].lower() for r in results}:
+            self.app.home.set_name(new)
+        done = "; ".join(f"{r['old']} {r['action']} -> {r['name']}" for r in results)
+        self.app.set_status(f"Fixed {len(ids)} reading(s) to '{new}'" + (f".  Records: {done}" if done else "."))
+
+    def load_selected(self) -> None:
+        ids = self._selected_ids()
+        if not ids:
+            return
+        r = self.app.db.reading(ids[0])
+        name = (r["fixed_name"] or r["saved_name"] or r["read_name"]) if r is not None else ""
+        if name:
+            self.app.home.set_name(name)
+            self.app.nb.select(0)
+
+    def delete_selected(self, _e=None) -> None:
+        ids = self._selected_ids()
+        if not ids:
+            return
+        if not messagebox.askyesno("Delete", f"Delete {len(ids)} reading(s) and their images? Records are not touched."):
+            return
+        self.app.log.delete(ids)
+        if self.app.home.reading_id in ids:
+            self.app.home.reading_id = None
+        self.refresh()
+        self.app.set_status(f"Deleted {len(ids)} reading(s).")
+
+    def open_folder(self) -> None:
+        folder = self.app.log.dir
+        folder.mkdir(parents=True, exist_ok=True)
+        try:
+            if sys.platform == "win32":
+                os.startfile(str(folder))  # noqa: S606
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(folder)])
+            else:
+                subprocess.Popen(["xdg-open", str(folder)])
+        except OSError as exc:
+            messagebox.showerror("Open folder", str(exc))
 
 
 # ============================================================================ Mini

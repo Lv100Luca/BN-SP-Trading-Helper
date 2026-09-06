@@ -1,6 +1,7 @@
 """SQLite storage for player records and app settings."""
 from __future__ import annotations
 
+import json
 import os
 import re
 import sqlite3
@@ -63,6 +64,22 @@ CREATE TABLE IF NOT EXISTS records (
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS readings (
+    id           INTEGER PRIMARY KEY,
+    ts           TEXT NOT NULL,
+    image        TEXT NOT NULL DEFAULT '',   -- file name inside the readings folder (see app/readings.py)
+    engine       TEXT NOT NULL DEFAULT '',
+    read_name    TEXT NOT NULL DEFAULT '',   -- what OCR produced ('' = nothing readable)
+    confidence   REAL NOT NULL DEFAULT 0,
+    alternatives TEXT NOT NULL DEFAULT '[]', -- JSON [[text, confidence], ...] of every row OCR found
+    region       TEXT NOT NULL DEFAULT '',   -- JSON [x, y, w, h] of the capture region at the time
+    preprocess   TEXT NOT NULL DEFAULT '',   -- JSON PreprocessConfig used for this read
+    source       TEXT NOT NULL DEFAULT '',   -- 'manual' (button / F5) or 'auto'
+    saved_name   TEXT NOT NULL DEFAULT '',   -- record name a state was saved under from this reading
+    saved_state  TEXT NOT NULL DEFAULT '',
+    fixed_name   TEXT NOT NULL DEFAULT '',   -- the name a human confirmed ('' = unchecked)
+    fixed_at     TEXT NOT NULL DEFAULT ''
 );
 """
 
@@ -284,9 +301,118 @@ class Database:
         self.conn.commit()
         return {"added": added, "updated": updated, "unchanged": unchanged, "skipped": skipped}
 
+    def rename_record(self, old: str, new: str) -> dict:
+        """Give the record `old` the name `new` (used to repair a state saved under an OCR misread).
+
+        If another record already answers to `new` (exact or loose match, like upsert), the two
+        are merged into one named `new`: newer state wins, times_seen add up, dates widen, notes
+        are joined. Readings that were saved under `old` follow the record. Returns
+        {"action": "renamed" | "merged" | "unchanged", "old": ..., "name": ...}.
+        """
+        old, new = normalize_name(old), normalize_name(new)
+        if not new:
+            raise ValueError("name is empty")
+        src = self.get(old, loose=False)
+        if src is None:
+            raise LookupError(f"no record named {old!r}")
+        dst = self.get(new)
+        if dst is None or dst["id"] == src["id"]:
+            if src["name"] == new:
+                action = "unchanged"
+            else:
+                self.conn.execute(
+                    "UPDATE records SET name = ?, name_key = ? WHERE id = ?", (new, name_key(new), src["id"])
+                )
+                action = "renamed"
+        else:
+            newer = src if src["updated_at"] >= dst["updated_at"] else dst  # tie: the record being fixed
+            notes = [n for n in (dst["notes"], src["notes"]) if n]
+            if len(notes) == 2 and notes[0] == notes[1]:
+                notes = notes[:1]
+            self.conn.execute("DELETE FROM records WHERE id = ?", (src["id"],))
+            self.conn.execute(
+                "UPDATE records SET name = ?, name_key = ?, state = ?, notes = ?, times_seen = ?,"
+                " created_at = ?, updated_at = ? WHERE id = ?",
+                (
+                    new, name_key(new), newer["state"], " | ".join(notes),
+                    src["times_seen"] + dst["times_seen"],
+                    min(src["created_at"], dst["created_at"]), max(src["updated_at"], dst["updated_at"]),
+                    dst["id"],
+                ),
+            )
+            action = "merged"
+        self.conn.execute(
+            "UPDATE readings SET saved_name = ? WHERE saved_name = ? COLLATE NOCASE", (new, src["name"])
+        )
+        self.conn.commit()
+        return {"action": action, "old": src["name"], "name": new}
+
     def counts(self) -> dict[str, int]:
         rows = self.conn.execute("SELECT state, COUNT(*) AS n FROM records GROUP BY state")
         return {r["state"]: r["n"] for r in rows}
+
+    # ----------------------------------------------------------------- readings
+    # One row per capture the app took a name from; the image itself lives in a folder next to
+    # the database (app/readings.py owns the files, this is just the metadata).
+    def add_reading(self, *, engine: str, read_name: str, confidence: float, alternatives: list,
+                    region, preprocess: dict, source: str) -> int:
+        cur = self.conn.execute(
+            "INSERT INTO readings (ts, engine, read_name, confidence, alternatives, region, preprocess, source)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (_now(), engine, read_name, float(confidence), json.dumps(alternatives, ensure_ascii=False),
+             json.dumps(list(region)) if region else "", json.dumps(preprocess or {}), source),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def set_reading_image(self, rid: int, image: str) -> None:
+        self.conn.execute("UPDATE readings SET image = ? WHERE id = ?", (image, rid))
+        self.conn.commit()
+
+    def mark_reading_saved(self, rid: int, saved_name: str, saved_state: str) -> None:
+        self.conn.execute(
+            "UPDATE readings SET saved_name = ?, saved_state = ? WHERE id = ?", (saved_name, saved_state, rid)
+        )
+        self.conn.commit()
+
+    def fix_reading(self, rid: int, fixed_name: str) -> None:
+        """Store the human-verified name (equal to read_name = 'the read was right')."""
+        self.conn.execute(
+            "UPDATE readings SET fixed_name = ?, fixed_at = ? WHERE id = ?", (normalize_name(fixed_name), _now(), rid)
+        )
+        self.conn.commit()
+
+    def reading(self, rid: int) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM readings WHERE id = ?", (rid,)).fetchone()
+
+    def readings(self, query: str = "", limit: int = 1000) -> list[sqlite3.Row]:
+        """Newest first. `query` matches the read, saved or fixed name."""
+        sql, params = "SELECT * FROM readings", []
+        if query:
+            sql += " WHERE read_name LIKE ? COLLATE NOCASE OR saved_name LIKE ? COLLATE NOCASE OR fixed_name LIKE ? COLLATE NOCASE"
+            params = [f"%{query}%"] * 3
+        sql += " ORDER BY id DESC LIMIT ?"
+        return self.conn.execute(sql, [*params, int(limit)]).fetchall()
+
+    def delete_readings(self, ids: Iterable[int]) -> list[str]:
+        """Remove rows; returns their image file names so the caller can delete the files."""
+        ids = [int(i) for i in ids]
+        if not ids:
+            return []
+        marks = ",".join("?" * len(ids))
+        images = [r["image"] for r in self.conn.execute(f"SELECT image FROM readings WHERE id IN ({marks})", ids)]
+        self.conn.execute(f"DELETE FROM readings WHERE id IN ({marks})", ids)
+        self.conn.commit()
+        return [i for i in images if i]
+
+    def stale_reading_ids(self, keep: int) -> list[int]:
+        """Ids of the oldest readings beyond the newest `keep` that nobody saved a state from or
+        checked -- the ones that can be thrown away to bound disk use."""
+        rows = self.conn.execute(
+            "SELECT id FROM readings WHERE saved_name = '' AND fixed_name = '' ORDER BY id DESC LIMIT -1 OFFSET ?",
+            (int(keep),),
+        ).fetchall()
+        return [r["id"] for r in rows]
 
     # ----------------------------------------------------------------- settings
     def get_setting(self, key: str, default: str | None = None) -> str | None:
