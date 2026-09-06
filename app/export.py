@@ -1,4 +1,4 @@
-"""Export records to CSV or JSON."""
+"""Export records to JSON (default) or CSV."""
 from __future__ import annotations
 
 import csv
@@ -40,11 +40,11 @@ def export_json(rows: Iterable, path: Path) -> int:
 
 
 def export_records(rows: Iterable, path: str | Path) -> int:
-    """Pick the format from the file extension (.json -> JSON, anything else -> CSV). Returns the row count."""
+    """Pick the format from the file extension (.csv -> CSV, anything else -> JSON). Returns the row count."""
     path = Path(path)
-    if path.suffix.lower() == ".json":
-        return export_json(rows, path)
-    return export_csv(rows, path)
+    if path.suffix.lower() == ".csv":
+        return export_csv(rows, path)
+    return export_json(rows, path)
 
 
 # ------------------------------------------------------------------------ import

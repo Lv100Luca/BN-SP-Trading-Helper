@@ -715,15 +715,15 @@ class RecordsTab(ttk.Frame):
         return self.app.db.all(q, None if f == "all" else f), (q == "" and f == "all")
 
     def export_rows(self) -> None:
-        """Save the rows currently listed (all records unless a search/filter is active) as CSV or JSON."""
+        """Save the rows currently listed (all records unless a search/filter is active) as JSON (or CSV)."""
         rows, is_everything = self._current_rows()
         if not rows:
             messagebox.showinfo("Export", "No records to export.")
             return
         path = filedialog.asksaveasfilename(
-            parent=self, title="Export records", defaultextension=".csv",
-            initialfile=f"trade-check-records-{time.strftime('%Y-%m-%d')}.csv",
-            filetypes=[("CSV (Excel)", "*.csv"), ("JSON", "*.json")],
+            parent=self, title="Export records", defaultextension=".json",
+            initialfile=f"trade-check-records-{time.strftime('%Y-%m-%d')}.json",
+            filetypes=[("JSON", "*.json"), ("CSV (Excel)", "*.csv")],
         )
         if not path:
             return
