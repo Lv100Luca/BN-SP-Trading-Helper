@@ -81,6 +81,14 @@ CREATE TABLE IF NOT EXISTS readings (
     fixed_name   TEXT NOT NULL DEFAULT '',   -- the name a human confirmed ('' = unchecked)
     fixed_at     TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS global_records (   -- read-only copy of the shared table (see app/sync.py)
+    name       TEXT PRIMARY KEY COLLATE NOCASE,
+    name_key   TEXT NOT NULL,
+    state      TEXT NOT NULL,
+    notes      TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_global_key ON global_records(name_key);
 """
 
 
@@ -195,6 +203,14 @@ class Database:
                 (name_key(name),),
             ).fetchone()
         return row
+
+    def find(self, name: str) -> tuple[sqlite3.Row | None, str]:
+        """Your own record first, then the shared global table. Returns (row, "local" | "global" | "")."""
+        rec = self.get(name)
+        if rec is not None:
+            return rec, "local"
+        rec = self.get_global(name)
+        return rec, ("global" if rec is not None else "")
 
     def upsert(self, name: str, state: str, notes: str | None = None) -> sqlite3.Row:
         """Record an encounter: insert, or overwrite state and bump times_seen."""
@@ -350,6 +366,59 @@ class Database:
     def counts(self) -> dict[str, int]:
         rows = self.conn.execute("SELECT state, COUNT(*) AS n FROM records GROUP BY state")
         return {r["state"]: r["n"] for r in rows}
+
+    # ------------------------------------------------------------- global table
+    # A copy of the shared read-only table the server hands out (app/sync.py fetches it; only
+    # replace_global() writes here). Looked up only when there is no local record for a name.
+    def get_global(self, name: str) -> sqlite3.Row | None:
+        name = normalize_name(name)
+        if not name:
+            return None
+        row = self.conn.execute(
+            "SELECT * FROM global_records WHERE name = ? COLLATE NOCASE", (name,)
+        ).fetchone()
+        if row is None and name_key(name):
+            row = self.conn.execute(
+                "SELECT * FROM global_records WHERE name_key = ? ORDER BY updated_at DESC LIMIT 1",
+                (name_key(name),),
+            ).fetchone()
+        return row
+
+    def replace_global(self, records: Iterable[dict], version: int, updated_at: str, etag: str = "") -> int:
+        """Swap in a freshly downloaded table. Returns the number of rows kept."""
+        rows = []
+        for r in records:
+            name = normalize_name(str(r.get("name", "")))
+            state = str(r.get("state", "")).lower()
+            if name and state in STATES:
+                rows.append((name, name_key(name), state, str(r.get("notes") or ""), str(r.get("updated_at") or "")))
+        with self.conn:  # one transaction: readers never see an empty table
+            self.conn.execute("DELETE FROM global_records")
+            self.conn.executemany(
+                "INSERT OR REPLACE INTO global_records (name, name_key, state, notes, updated_at) VALUES (?, ?, ?, ?, ?)",
+                rows,
+            )
+            for key, value in (("global_version", version), ("global_updated_at", updated_at),
+                               ("global_etag", etag), ("global_synced_at", _now())):
+                self.conn.execute(
+                    "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (key, str(value)),
+                )
+        return len(rows)
+
+    def touch_global(self) -> None:
+        """The server said our copy is still current: only bump the sync time."""
+        self.set_setting("global_synced_at", _now())
+
+    def global_info(self) -> dict:
+        count = self.conn.execute("SELECT COUNT(*) FROM global_records").fetchone()[0]
+        return {
+            "count": count,
+            "version": int(self.get_setting("global_version", "0") or 0),
+            "updated_at": self.get_setting("global_updated_at", "") or "",
+            "synced_at": self.get_setting("global_synced_at", "") or "",
+            "etag": self.get_setting("global_etag", "") or "",
+        }
 
     # ----------------------------------------------------------------- readings
     # One row per capture the app took a name from; the image itself lives in a folder next to

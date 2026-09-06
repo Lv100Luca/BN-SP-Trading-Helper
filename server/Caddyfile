@@ -1,0 +1,5 @@
+# Caddy terminates HTTPS (automatic Let's Encrypt certificate) and forwards to the Python service.
+# Replace the host name; nothing else needs changing.
+table.example.com {
+    reverse_proxy 127.0.0.1:8787
+}

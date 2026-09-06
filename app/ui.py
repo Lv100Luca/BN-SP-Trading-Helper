@@ -17,13 +17,14 @@ from tkinter import filedialog, messagebox, ttk
 import numpy as np
 from PIL import Image, ImageTk
 
-from . import REPO_URL, __version__, capture, export, ocr, readings
+from . import REPO_URL, __version__, capture, export, ocr, readings, sync
 from .db import STATES, Database, name_key
 
 STATE_LABELS = {"trading": "TRADING", "fighting": "FIGHTING", "afk": "AFK", "fake": "FAKE"}
 STATE_COLORS = {"trading": "#2e7d32", "fighting": "#c62828", "afk": "#616161", "fake": "#f9a825"}
 STATE_FG = {"trading": "white", "fighting": "white", "afk": "white", "fake": "#212121"}  # button text
 STATE_PALE = {"trading": "#e8f5e9", "fighting": "#ffebee", "afk": "#eeeeee", "fake": "#fff8e1"}
+GLOBAL_PALE = "#e3f2fd"   # previous-record panel when the state comes from the shared table
 PREVIEW_MAX = (520, 140)
 READING_PREVIEW_MAX = (620, 160)
 
@@ -114,6 +115,11 @@ class App(tk.Tk):
         self.mini: MiniWindow | None = None
         if self.db.get_setting("mini_mode") == "1":
             self.after(200, self.enter_mini)
+        self._sync_results: queue.Queue = queue.Queue()
+        self._sync_busy = False
+        self._refresh_global_label()
+        if sync.table_url():
+            self.after(1500, self.refresh_global)  # let the window come up first
 
     def _build_footer(self) -> None:
         """Status text on the left; a small About section (version + GitHub link) on the right."""
@@ -125,7 +131,66 @@ class App(tk.Tk):
         link = ttk.Label(about, text="GitHub", foreground="#1565c0", cursor="hand2", font=("", 9, "underline"))
         link.pack(side="left", padx=(4, 0))
         link.bind("<Button-1>", lambda _e: webbrowser.open(REPO_URL))
+        self.global_var: tk.StringVar | None = None
+        self.global_btn: ttk.Button | None = None
+        if sync.table_url():
+            ttk.Label(about, text="  ·", foreground="#666").pack(side="left")
+            self.global_var = tk.StringVar()
+            ttk.Label(about, textvariable=self.global_var, foreground="#666").pack(side="left", padx=(4, 0))
+            self.global_btn = ttk.Button(about, text="Refresh", width=8, command=self.refresh_global)
+            self.global_btn.pack(side="left", padx=(6, 0))
         ttk.Label(footer, textvariable=self.status, anchor="w").pack(side="left", fill="x", expand=True)
+
+    # ------------------------------------------------------------ global table
+    def _refresh_global_label(self) -> None:
+        if self.global_var is None:
+            return
+        info = self.db.global_info()
+        if not info["synced_at"]:
+            self.global_var.set("Global table: not downloaded yet")
+        else:
+            self.global_var.set(f"Global table: {info['count']} names (synced {info['synced_at'][11:16]})")
+
+    def refresh_global(self) -> None:
+        """Download the shared table in a worker thread; the result is applied on the UI thread."""
+        url = sync.table_url()
+        if not url or self._sync_busy:
+            return
+        self._sync_busy = True
+        if self.global_btn is not None:
+            self.global_btn.configure(state="disabled")
+        etag = self.db.global_info()["etag"]
+
+        def work() -> None:  # no tkinter or sqlite calls in here
+            try:
+                self._sync_results.put(("ok", sync.fetch_table(url, etag)))
+            except sync.SyncError as exc:
+                self._sync_results.put(("error", str(exc)))
+            except Exception as exc:  # noqa: BLE001
+                self._sync_results.put(("error", f"{type(exc).__name__}: {exc}"))
+
+        threading.Thread(target=work, daemon=True).start()
+        self.after(100, self._poll_sync)
+
+    def _poll_sync(self) -> None:
+        try:
+            kind, payload = self._sync_results.get_nowait()
+        except queue.Empty:
+            self.after(100, self._poll_sync)
+            return
+        self._sync_busy = False
+        if self.global_btn is not None:
+            self.global_btn.configure(state="normal")
+        if kind == "error":
+            self.set_status(f"Global table: {payload}")
+        elif payload.status == "unchanged":
+            self.db.touch_global()
+            self.set_status("Global table is up to date.")
+        else:
+            n = self.db.replace_global(payload.records, payload.version, payload.updated_at, payload.etag)
+            self.set_status(f"Global table updated: {n} names (v{payload.version}).")
+        self._refresh_global_label()
+        self.home.lookup(quiet=True)  # the name on screen may now have a global hit
 
     # --------------------------------------------------------------- mini mode
     def enter_mini(self) -> None:
@@ -133,7 +198,7 @@ class App(tk.Tk):
             return
         self.withdraw()
         self.mini = MiniWindow(self)
-        self.mini.set_record(self.home.current_record, self.home.name_var.get().strip())
+        self.mini.set_record(self.home.current_record, self.home.name_var.get().strip(), self.home.current_source)
         self.db.set_setting("mini_mode", "1")
 
     def exit_mini(self) -> None:
@@ -144,9 +209,9 @@ class App(tk.Tk):
         self.deiconify()
         self.lift()
 
-    def update_mini(self, rec, name: str) -> None:
+    def update_mini(self, rec, name: str, source: str = "local") -> None:
         if self.mini is not None:
-            self.mini.set_record(rec, name)
+            self.mini.set_record(rec, name, source)
 
     # ------------------------------------------------------------------ helpers
     def set_status(self, text: str) -> None:
@@ -199,6 +264,7 @@ class HomeTab(ttk.Frame):
         self._busy = False
         self._results: queue.Queue = queue.Queue()  # worker thread -> UI thread hand-off
         self.current_record = None      # sqlite3.Row shown in the previous-record panel (or None)
+        self.current_source = ""        # "local" (your records), "global" (shared table) or ""
         self._typing_until = 0.0        # auto-read leaves the name box alone until this time
         self._auto_job: str | None = None
         self._auto_run = False          # is the OCR currently in flight an auto-read?
@@ -502,18 +568,31 @@ class HomeTab(ttk.Frame):
         self.name_var.set(name)
         self.lookup()
 
-    def lookup(self) -> None:
+    def lookup(self, quiet: bool = False) -> None:
+        """Show the record for the name in the box: yours first, else the shared global table.
+        `quiet` re-runs the lookup after a global table refresh and does nothing when the box is empty."""
         name = self.name_var.get().strip()
-        rec = self.app.db.get(name) if name else None
-        self._show_prev(rec, name)
+        if quiet and not name:
+            return
+        rec, source = self.app.db.find(name) if name else (None, "")
+        self._show_prev(rec, name, source)
 
-    def _show_prev(self, rec, name: str) -> None:
+    def _show_prev(self, rec, name: str, source: str = "local") -> None:
         self.current_record = rec
-        self.app.update_mini(rec, name)
+        self.current_source = source if rec is not None else ""
+        self.app.update_mini(rec, name, self.current_source)
         if not name:
             self._paint_prev("No name read yet", "", bg=None, fg="black")
         elif rec is None:
             self._paint_prev(f"{name}: no previous record", "First time seeing this player.", bg="#fff8e1", fg="#795548")
+        elif source == "global":
+            st = rec["state"]
+            notes = f"   |   {rec['notes']}" if rec["notes"] else ""
+            self._paint_prev(
+                f"{rec['name']}: {STATE_LABELS[st]} in the global table",
+                f"Not in your own records   |   table entry from {rec['updated_at'][:10]}{notes}",
+                bg=GLOBAL_PALE, fg=STATE_COLORS[st],
+            )
         else:
             st = rec["state"]
             self._paint_prev(
@@ -538,7 +617,7 @@ class HomeTab(ttk.Frame):
         rec = self.app.db.upsert(name, state)
         if self.app.log is not None and self.reading_id is not None:
             self.app.db.mark_reading_saved(self.reading_id, rec["name"], state)
-        self._show_prev(rec, name)
+        self._show_prev(rec, name, "local")
         if prev is not None and prev["state"] != state:
             self.app.set_status(
                 f"{rec['name']}: {STATE_LABELS[prev['state']]} -> {STATE_LABELS[state]} (overwritten)"
@@ -1014,11 +1093,17 @@ class MiniWindow(tk.Toplevel):
         self.update_idletasks()
         self.lift()
 
-    def set_record(self, rec, name: str) -> None:
+    def set_record(self, rec, name: str, source: str = "local") -> None:
         if not name:
             self.state_lbl.configure(text="waiting for a name...", fg=MINI_DIM)
         elif rec is None:
             self.state_lbl.configure(text="NEW  -  no record yet", fg=MINI_NEW_FG)
+        elif source == "global":
+            st = rec["state"]
+            self.state_lbl.configure(
+                text=f"{STATE_LABELS[st]}  -  global table  -  {rec['updated_at'][:10]}",
+                fg=MINI_STATE_FG[st],
+            )
         else:
             st = rec["state"]
             self.state_lbl.configure(
