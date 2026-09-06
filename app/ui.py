@@ -736,10 +736,10 @@ class RecordsTab(ttk.Frame):
         self.app.set_status(f"Exported {n} ({scope}) to {path}")
 
     def import_rows(self) -> None:
-        """Merge records from a CSV/JSON export or another records.sqlite into this database."""
+        """Merge records from a JSON (or CSV) export or another records.sqlite into this database."""
         path = filedialog.askopenfilename(
             parent=self, title="Import records",
-            filetypes=[("Trade Check exports", "*.csv *.json *.sqlite"), ("All files", "*.*")],
+            filetypes=[("JSON", "*.json"), ("CSV", "*.csv"), ("SQLite database", "*.sqlite"), ("All files", "*.*")],
         )
         if not path:
             return

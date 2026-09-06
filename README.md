@@ -39,7 +39,7 @@ Python 3.10+ with tkinter (bundled on Windows/macOS; on Linux `sudo apt install 
    **TRADING / FIGHTING / AFK / FAKE**. Existing records are overwritten.
 5. **Records** tab: search, filter by state, double-click to load a name into Home, change state or delete.
    **Export...** saves the listed records as JSON (or CSV for Excel); with a search or filter active only
-   the shown rows are exported. **Import...** merges a CSV/JSON export or another `records.sqlite` into
+   the shown rows are exported. **Import...** merges a JSON (or CSV) export or another `records.sqlite` into
    your data (newer state wins, no duplicates).
 6. **Mini mode** (button in the top row): shrinks the app to a small always-on-top overlay with just the
    name, its previous state and the four state buttons, so it can sit in front of the game. Drag the text to
