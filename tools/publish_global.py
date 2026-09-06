@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Upload a Trade Check export to the global table server (see server/README.md).
+"""Upload a Trade Check export to the global table server
+(https://github.com/Lv100Luca/BN-SP-Trading-Helper-API).
 
     python tools/publish_global.py https://table.example.com records.json [--token TOKEN]
 

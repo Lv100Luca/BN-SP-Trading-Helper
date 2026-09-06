@@ -68,7 +68,8 @@ file to keep your records; `Export...` in the Records tab gives you a CSV/JSON c
 ## Global table (shared, read-only)
 
 Besides your own records the app can consult a shared lookup table hosted on a small server
-(`server/`, one Python file, see `server/README.md`). The client downloads the whole table once at
+([BN-SP-Trading-Helper-API](https://github.com/Lv100Luca/BN-SP-Trading-Helper-API): one Python
+file, deployed to the VPS by its CI). The client downloads the whole table once at
 start-up and whenever you press **Refresh** in the footer, keeps the copy in the local database and
 looks names up offline. A name that is not in your records but is in the table shows up in a blue
 panel marked *global table*; your own records always win. Only the server admin can change the
@@ -161,8 +162,7 @@ app/capture.py      mss screen grab + drag-to-select overlay
 app/ocr.py          preprocessing, OCR engines (RapidOCR default, Tesseract optional), name picking
 app/ui.py           tkinter UI (Home, Records and Readings tabs)
 tools/ocr_tune.py   batch OCR over samples/ (or --readings: the logged captures) for tuning
-tools/publish_global.py  upload a records export to the global table server
-server/             the global table server: stdlib HTTP API, systemd unit, Caddyfile
+tools/publish_global.py  upload a records export to the global table server (separate repo)
 samples/            drop screenshots here
 data/               legacy DB location (pre-0.3); migrated automatically
 ```

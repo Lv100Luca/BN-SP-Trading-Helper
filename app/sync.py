@@ -1,4 +1,5 @@
-"""Download the shared, read-only lookup table from the server (server/tradecheck_server.py).
+"""Download the shared, read-only lookup table from the server
+(https://github.com/Lv100Luca/BN-SP-Trading-Helper-API).
 
 The whole table comes down in one GET; the app keeps a copy in the local database
 (Database.replace_global) and answers lookups from there, so reading a name never touches the
