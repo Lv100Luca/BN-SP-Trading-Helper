@@ -8,7 +8,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-STATES = ("trading", "fighting", "afk")
+STATES = ("trading", "fighting", "afk", "fake")
 APP_NAME = "TradeCheck"
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -59,7 +59,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS records (
     id          INTEGER PRIMARY KEY,
     name        TEXT NOT NULL UNIQUE COLLATE NOCASE,
-    state       TEXT NOT NULL CHECK (state IN ('trading', 'fighting', 'afk')),
+    state       TEXT NOT NULL,
     notes       TEXT NOT NULL DEFAULT '',
     times_seen  INTEGER NOT NULL DEFAULT 1,
     created_at  TEXT NOT NULL,
@@ -105,6 +105,30 @@ class Database:
         if "name_key" not in cols:
             self.conn.execute("ALTER TABLE records ADD COLUMN name_key TEXT NOT NULL DEFAULT ''")
             self.conn.commit()
+        row = self.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'records'"
+        ).fetchone()
+        if row and "CHECK" in row["sql"]:
+            # v0.1 hard-coded the allowed states in a CHECK constraint; SQLite cannot alter it,
+            # so rebuild the table (states are validated in Python now).
+            self.conn.executescript("""
+                BEGIN;
+                CREATE TABLE records_new (
+                    id          INTEGER PRIMARY KEY,
+                    name        TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                    state       TEXT NOT NULL,
+                    notes       TEXT NOT NULL DEFAULT '',
+                    times_seen  INTEGER NOT NULL DEFAULT 1,
+                    created_at  TEXT NOT NULL,
+                    updated_at  TEXT NOT NULL,
+                    name_key    TEXT NOT NULL DEFAULT ''
+                );
+                INSERT INTO records_new (id, name, state, notes, times_seen, created_at, updated_at, name_key)
+                    SELECT id, name, state, notes, times_seen, created_at, updated_at, name_key FROM records;
+                DROP TABLE records;
+                ALTER TABLE records_new RENAME TO records;
+                COMMIT;
+            """)
 
     def _backfill_keys(self) -> None:
         rows = self.conn.execute("SELECT id, name FROM records WHERE name_key = ''").fetchall()

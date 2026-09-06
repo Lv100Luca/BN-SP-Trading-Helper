@@ -15,9 +15,10 @@ from PIL import Image, ImageTk
 from . import __version__, capture, ocr
 from .db import STATES, Database, name_key
 
-STATE_LABELS = {"trading": "TRADING", "fighting": "FIGHTING", "afk": "AFK"}
-STATE_COLORS = {"trading": "#2e7d32", "fighting": "#c62828", "afk": "#616161"}
-STATE_PALE = {"trading": "#e8f5e9", "fighting": "#ffebee", "afk": "#eeeeee"}
+STATE_LABELS = {"trading": "TRADING", "fighting": "FIGHTING", "afk": "AFK", "fake": "FAKE"}
+STATE_COLORS = {"trading": "#2e7d32", "fighting": "#c62828", "afk": "#616161", "fake": "#f9a825"}
+STATE_FG = {"trading": "white", "fighting": "white", "afk": "white", "fake": "#212121"}  # button text
+STATE_PALE = {"trading": "#e8f5e9", "fighting": "#ffebee", "afk": "#eeeeee", "fake": "#fff8e1"}
 PREVIEW_MAX = (520, 140)
 
 
@@ -66,7 +67,7 @@ class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(f"Trade Check v{__version__}")
-        self.minsize(580, 600)
+        self.minsize(660, 600)
         try:
             self.tk.call("tk", "scaling", self.winfo_fpixels("1i") / 72.0)
         except tk.TclError:
@@ -241,8 +242,8 @@ class HomeTab(ttk.Frame):
         for st in STATES:
             tk.Button(
                 row, text=STATE_LABELS[st], font=("", 12, "bold"), height=2,
-                bg=STATE_COLORS[st], fg="white",
-                activebackground=STATE_COLORS[st], activeforeground="white",
+                bg=STATE_COLORS[st], fg=STATE_FG[st],
+                activebackground=STATE_COLORS[st], activeforeground=STATE_FG[st],
                 command=lambda s=st: self.save_state(s),
             ).pack(side="left", fill="x", expand=True, padx=3)
 
@@ -538,12 +539,13 @@ class RecordsTab(ttk.Frame):
         btns = ttk.Frame(self)
         btns.pack(fill="x", pady=(8, 0))
         ttk.Button(btns, text="Load into Home", command=self.load_selected).pack(side="left")
+        ttk.Label(btns, text="Set:").pack(side="left", padx=(10, 0))
         for st in STATES:
             tk.Button(
-                btns, text=f"Set {STATE_LABELS[st]}", bg=STATE_COLORS[st], fg="white",
-                activebackground=STATE_COLORS[st], activeforeground="white",
+                btns, text=STATE_LABELS[st], bg=STATE_COLORS[st], fg=STATE_FG[st],
+                activebackground=STATE_COLORS[st], activeforeground=STATE_FG[st],
                 command=lambda s=st: self.set_selected_state(s),
-            ).pack(side="left", padx=(6, 0))
+            ).pack(side="left", padx=(4, 0))
         ttk.Button(btns, text="Delete", command=self.delete_selected).pack(side="right")
         ttk.Button(btns, text="Refresh", command=self.refresh).pack(side="right", padx=(0, 6))
 
@@ -604,7 +606,8 @@ class RecordsTab(ttk.Frame):
 MINI_BG = "#202124"
 MINI_FG = "#f5f5f5"
 MINI_DIM = "#9e9e9e"
-MINI_STATE_FG = {"trading": "#66bb6a", "fighting": "#ef5350", "afk": "#bdbdbd"}
+MINI_STATE_FG = {"trading": "#66bb6a", "fighting": "#ef5350", "afk": "#bdbdbd", "fake": "#ffd54f"}
+MINI_NEW_FG = "#80d8ff"
 
 
 class MiniWindow(tk.Toplevel):
@@ -642,8 +645,8 @@ class MiniWindow(tk.Toplevel):
         btns.pack(fill="x", padx=4, pady=4)
         for st in STATES:
             tk.Button(
-                btns, text=STATE_LABELS[st], bg=STATE_COLORS[st], fg="white",
-                activebackground=STATE_COLORS[st], activeforeground="white",
+                btns, text=STATE_LABELS[st], bg=STATE_COLORS[st], fg=STATE_FG[st],
+                activebackground=STATE_COLORS[st], activeforeground=STATE_FG[st],
                 font=("", 9, "bold"), bd=0, padx=6, pady=3,
                 command=lambda s=st: app.home.save_state(s),
             ).pack(side="left", fill="x", expand=True, padx=2)
@@ -665,7 +668,7 @@ class MiniWindow(tk.Toplevel):
         if not name:
             self.state_lbl.configure(text="waiting for a name...", fg=MINI_DIM)
         elif rec is None:
-            self.state_lbl.configure(text="NEW  -  no record yet", fg="#ffd54f")
+            self.state_lbl.configure(text="NEW  -  no record yet", fg=MINI_NEW_FG)
         else:
             st = rec["state"]
             self.state_lbl.configure(
