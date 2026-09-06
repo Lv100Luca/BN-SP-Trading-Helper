@@ -88,6 +88,12 @@ class RapidOcrEngine:
     DET_LIMIT_SIDE = 960
     TEXT_SCORE = 0.4  # RapidOCR drops results below this; short names score ~0.5, so leave margin
 
+    # Angle classifier OFF. It only ever decides "0 or 180 degrees", and on this game's slab-serif
+    # nameplate font it sometimes votes 180 and hands the recogniser an upside-down crop:
+    # "Wonzgonz" came back as "Zuo6zuoM" (conf 0.70); with the classifier off, "Wonzgonz" at 0.88.
+    # Nameplates are never rotated, so there is nothing for it to fix.
+    USE_ANGLE_CLS = False
+
     def __init__(self) -> None:
         try:
             from rapidocr_onnxruntime import RapidOCR  # type: ignore
@@ -95,7 +101,7 @@ class RapidOcrEngine:
             try:
                 self._ocr = RapidOCR(
                     det_model_path=None, det_limit_side_len=self.DET_LIMIT_SIDE, det_limit_type="max",
-                    text_score=self.TEXT_SCORE,
+                    text_score=self.TEXT_SCORE, use_angle_cls=self.USE_ANGLE_CLS,
                 )
             except (TypeError, KeyError):  # other 1.x versions with a different override scheme
                 self._ocr = RapidOCR()
@@ -105,7 +111,7 @@ class RapidOcrEngine:
             try:
                 self._ocr = RapidOCR(params={
                     "Det.limit_side_len": self.DET_LIMIT_SIDE, "Det.limit_type": "max",
-                    "Global.text_score": self.TEXT_SCORE,
+                    "Global.text_score": self.TEXT_SCORE, "Global.use_cls": self.USE_ANGLE_CLS,
                 })
             except Exception:  # noqa: BLE001
                 self._ocr = RapidOCR()
