@@ -1,0 +1,8 @@
+# file<TAB>expected name
+20260905205035_1.jpg	Mr. Anomas
+20260905205038_1.jpg	Mr. Anomas
+20260905210804_1.jpg	Xaltorik
+20260905212959_1.jpg	Hutchclutch211
+20260905213001_1.jpg	Hutchclutch211
+20260905223612_1.jpg	Bz
+20260905223705_1.jpg	Dunrobin
