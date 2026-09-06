@@ -7,6 +7,7 @@ import sqlite3
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Iterable
 
 STATES = ("trading", "fighting", "afk", "fake")
 APP_NAME = "TradeCheck"
@@ -24,36 +25,29 @@ def _user_data_dir() -> Path:
     return base / APP_NAME
 
 
-def _writable(d: Path) -> bool:
-    try:
-        d.mkdir(parents=True, exist_ok=True)
-        probe = d / ".write_test"
-        probe.touch()
-        probe.unlink()
-        return True
-    except OSError:
-        return False
+def legacy_data_dir() -> Path:
+    """Where versions before 0.3 kept the database: next to the exe (frozen) or in the project (source)."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent / "data"
+    return ROOT / "data"
 
 
 def data_dir() -> Path:
-    """Where the SQLite file lives.
+    """One shared per-user folder, so the source checkout and the packaged exe see the same records.
 
-    - running from source:            <project>/data/
-    - frozen single-file executable:  <folder of the exe>/data/ (portable), falling back to the
-                                      per-user app-data folder when that is not writable
-                                      (macOS .app bundles always use the per-user folder).
+    Windows: %APPDATA%/TradeCheck   macOS: ~/Library/Application Support/TradeCheck
+    Linux: $XDG_DATA_HOME/TradeCheck (default ~/.local/share/TradeCheck).
+    Override with the TRADECHECK_DATA_DIR environment variable (e.g. for a portable USB setup).
     """
-    if not getattr(sys, "frozen", False):
-        return ROOT / "data"
-    if sys.platform != "darwin":
-        portable = Path(sys.executable).resolve().parent / "data"
-        if _writable(portable):
-            return portable
+    override = os.environ.get("TRADECHECK_DATA_DIR")
+    if override:
+        return Path(override).expanduser()
     return _user_data_dir()
 
 
 DATA_DIR = data_dir()
 DB_PATH = DATA_DIR / "records.sqlite"
+LEGACY_DB_PATH = legacy_data_dir() / "records.sqlite"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS records (
@@ -89,7 +83,7 @@ def name_key(name: str) -> str:
 
 
 class Database:
-    def __init__(self, path: Path | None = None):
+    def __init__(self, path: Path | None = None, absorb_legacy: bool = True):
         path = Path(path) if path else DB_PATH
         path.parent.mkdir(parents=True, exist_ok=True)
         self.path = path
@@ -99,6 +93,35 @@ class Database:
         self._migrate()
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_records_key ON records(name_key)")
         self._backfill_keys()
+        self.migration_report: dict | None = None
+        if absorb_legacy:
+            self._absorb_legacy(LEGACY_DB_PATH)
+
+    def _absorb_legacy(self, legacy: Path) -> None:
+        """One-time: merge a pre-0.3 database (project data/ or next to the exe) into this shared one.
+
+        Records are merged (newer state wins, times_seen keeps the max), settings this database
+        lacks are copied over, and the old file is renamed to *.migrated so it is not read twice.
+        """
+        try:
+            if not legacy.exists() or legacy.resolve() == self.path.resolve():
+                return
+            other = Database(legacy, absorb_legacy=False)
+            try:
+                report = self.merge_records(dict(r) for r in other.all())
+                for key, value in other.all_settings().items():
+                    if self.get_setting(key) is None:
+                        self.set_setting(key, value)
+            finally:
+                other.close()
+            report["source"] = str(legacy)
+            try:
+                legacy.rename(legacy.with_name(legacy.name + ".migrated"))
+            except OSError:
+                pass  # still open elsewhere; merging is idempotent, so it is retried next start
+            self.migration_report = report
+        except Exception as exc:  # noqa: BLE001 - never block start-up on a migration hiccup
+            print(f"legacy database migration skipped: {exc}", file=sys.stderr)
 
     def _migrate(self) -> None:
         cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(records)")}
@@ -216,6 +239,51 @@ class Database:
         )
         self.conn.commit()
 
+    def merge_records(self, records: Iterable[dict]) -> dict[str, int]:
+        """Merge exported/imported rows. Keys: name, state, times_seen, first_seen|created_at,
+        last_updated|updated_at, notes. Newer state wins, times_seen keeps the max, dates widen."""
+        added = updated = unchanged = skipped = 0
+        for rec in records:
+            name = normalize_name(str(rec.get("name") or ""))
+            state = str(rec.get("state") or "").strip().lower()
+            if not name or state not in STATES:
+                skipped += 1
+                continue
+            try:
+                seen = max(1, int(rec.get("times_seen") or 1))
+            except (TypeError, ValueError):
+                seen = 1
+            first = str(rec.get("first_seen") or rec.get("created_at") or _now())
+            last = str(rec.get("last_updated") or rec.get("updated_at") or first)
+            notes = str(rec.get("notes") or "")
+            existing = self.get(name)
+            if existing is None:
+                self.conn.execute(
+                    "INSERT INTO records (name, state, notes, times_seen, created_at, updated_at, name_key)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (name, state, notes, seen, first, last, name_key(name)),
+                )
+                added += 1
+                continue
+            merged = (
+                state if last > existing["updated_at"] else existing["state"],
+                notes or existing["notes"],
+                max(seen, existing["times_seen"]),
+                min(first, existing["created_at"]),
+                max(last, existing["updated_at"]),
+            )
+            current = (existing["state"], existing["notes"], existing["times_seen"], existing["created_at"], existing["updated_at"])
+            if merged == current:
+                unchanged += 1
+                continue
+            self.conn.execute(
+                "UPDATE records SET state = ?, notes = ?, times_seen = ?, created_at = ?, updated_at = ? WHERE id = ?",
+                (*merged, existing["id"]),
+            )
+            updated += 1
+        self.conn.commit()
+        return {"added": added, "updated": updated, "unchanged": unchanged, "skipped": skipped}
+
     def counts(self) -> dict[str, int]:
         rows = self.conn.execute("SELECT state, COUNT(*) AS n FROM records GROUP BY state")
         return {r["state"]: r["n"] for r in rows}
@@ -224,6 +292,9 @@ class Database:
     def get_setting(self, key: str, default: str | None = None) -> str | None:
         row = self.conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
         return row["value"] if row else default
+
+    def all_settings(self) -> dict[str, str]:
+        return {r["key"]: r["value"] for r in self.conn.execute("SELECT key, value FROM settings")}
 
     def set_setting(self, key: str, value: str) -> None:
         self.conn.execute(

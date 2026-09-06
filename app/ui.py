@@ -7,12 +7,13 @@ import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import messagebox, ttk
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
 from PIL import Image, ImageTk
 
-from . import __version__, capture, ocr
+from . import __version__, capture, export, ocr
 from .db import STATES, Database, name_key
 
 STATE_LABELS = {"trading": "TRADING", "fighting": "FIGHTING", "afk": "AFK", "fake": "FAKE"}
@@ -82,6 +83,12 @@ class App(tk.Tk):
         )
 
         self.status = tk.StringVar(value="Ready.")
+        if self.db.migration_report:
+            r = self.db.migration_report
+            self.status.set(
+                f"Moved records to the shared database ({self.db.path}): {r['added']} added, "
+                f"{r['updated']} updated from {r['source']}"
+            )
         self.nb = ttk.Notebook(self)
         self.nb.pack(fill="both", expand=True, padx=6, pady=(6, 0))
         self.home = HomeTab(self.nb, self)
@@ -546,8 +553,12 @@ class RecordsTab(ttk.Frame):
                 activebackground=STATE_COLORS[st], activeforeground=STATE_FG[st],
                 command=lambda s=st: self.set_selected_state(s),
             ).pack(side="left", padx=(4, 0))
-        ttk.Button(btns, text="Delete", command=self.delete_selected).pack(side="right")
-        ttk.Button(btns, text="Refresh", command=self.refresh).pack(side="right", padx=(0, 6))
+        tools = ttk.Frame(self)
+        tools.pack(fill="x", pady=(6, 0))
+        ttk.Button(tools, text="Import...", command=self.import_rows).pack(side="left")
+        ttk.Button(tools, text="Export...", command=self.export_rows).pack(side="left", padx=(6, 0))
+        ttk.Button(tools, text="Delete", command=self.delete_selected).pack(side="right")
+        ttk.Button(tools, text="Refresh", command=self.refresh).pack(side="right", padx=(0, 6))
 
     def refresh(self) -> None:
         q = self.search_var.get().strip()
@@ -569,6 +580,51 @@ class RecordsTab(ttk.Frame):
         self.count_var.set(
             f"{len(rows)} shown / {total} total   "
             f"(trading {c.get('trading', 0)}, fighting {c.get('fighting', 0)}, afk {c.get('afk', 0)})"
+        )
+
+    def _current_rows(self):
+        q = self.search_var.get().strip()
+        f = self.filter_var.get()
+        return self.app.db.all(q, None if f == "all" else f), (q == "" and f == "all")
+
+    def export_rows(self) -> None:
+        """Save the rows currently listed (all records unless a search/filter is active) as CSV or JSON."""
+        rows, is_everything = self._current_rows()
+        if not rows:
+            messagebox.showinfo("Export", "No records to export.")
+            return
+        path = filedialog.asksaveasfilename(
+            parent=self, title="Export records", defaultextension=".csv",
+            initialfile=f"trade-check-records-{time.strftime('%Y-%m-%d')}.csv",
+            filetypes=[("CSV (Excel)", "*.csv"), ("JSON", "*.json")],
+        )
+        if not path:
+            return
+        try:
+            n = export.export_records(rows, path)
+        except OSError as exc:
+            messagebox.showerror("Export failed", str(exc))
+            return
+        scope = "all records" if is_everything else "the records currently shown"
+        self.app.set_status(f"Exported {n} ({scope}) to {path}")
+
+    def import_rows(self) -> None:
+        """Merge records from a CSV/JSON export or another records.sqlite into this database."""
+        path = filedialog.askopenfilename(
+            parent=self, title="Import records",
+            filetypes=[("Trade Check exports", "*.csv *.json *.sqlite"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            report = self.app.db.merge_records(export.read_records(path))
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Import failed", str(exc))
+            return
+        self.refresh()
+        self.app.set_status(
+            f"Imported from {Path(path).name}: {report['added']} added, {report['updated']} updated, "
+            f"{report['unchanged']} unchanged, {report['skipped']} skipped"
         )
 
     def _selected_names(self) -> list[str]:

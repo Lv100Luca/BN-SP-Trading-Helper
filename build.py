@@ -6,8 +6,8 @@ r"""Build the single-file executable with PyInstaller; optionally package it as 
     .venv\Scripts\python build.py --console   # keep a console window (debugging)
 
 PyInstaller does not cross-compile: run this on each OS you ship to, or push a tag and let
-.github/workflows/release.yml build all three. The executable keeps its SQLite database in a
-`data/` folder next to itself (see app/db.py). Bump the version in app/__init__.py.
+.github/workflows/release.yml build all three. The database lives in the per-user app-data
+folder shared with the source checkout (see app/db.py). Bump the version in app/__init__.py.
 """
 from __future__ import annotations
 
@@ -105,7 +105,9 @@ Quick start
 4. "Mini mode" shrinks the app to a small always-on-top overlay to keep over the game
    (windowed or borderless mode; exclusive fullscreen hides overlays).
 
-Your records live in the data folder next to the executable. Copy it to keep them.
+Your records live in one shared per-user database (Windows: %APPDATA%/TradeCheck/records.sqlite),
+so this exe and a source checkout on the same machine see the same data. Back that file up to keep
+your records. A data folder from an older version next to the exe is merged in automatically.
 Troubleshooting: run "{exe} --selftest" - it writes selftest.txt ending in OK.
 """
 
