@@ -192,8 +192,12 @@ def make_engine(name: str = "auto") -> OcrEngine:
 
 
 # --------------------------------------------------------------------- name logic
-# Characters allowed in a player name. Loosen/tighten once we see real screenshots.
-_ALLOWED = re.compile(r"[^\w \-\.\[\]\|'#]+", re.UNICODE)
+# Characters allowed in a player name: word characters (letters, digits, "_"), space, and the
+# punctuation players actually put in names and clan tags. Kept as an allowlist so control
+# characters and stray unicode from a bad read are dropped, but wide enough that nothing a
+# player can legitimately type is silently deleted -- a name that loses a bracket or a dash no
+# longer matches its own record.
+_ALLOWED = re.compile(r"""[^\w \-.\[\](){}<>|'"`~!?@#$%^&*+=,:;/]+""", re.UNICODE)
 # Rows that are never a name: bare numbers and the "Lvl. 45" line under the nameplate.
 _NOT_A_NAME = re.compile(r"^\W*(lvl|lv|level)?\W*\d+\W*$", re.IGNORECASE)
 

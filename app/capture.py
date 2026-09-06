@@ -15,8 +15,27 @@ def virtual_screen() -> dict:
         return dict(sct.monitors[0])
 
 
-def grab(region: Region) -> Image.Image:
+# A hand-dragged region is always a bit off. Grabbing a few extra REAL pixels around it is
+# free insurance: a box that clips the top of the glyphs turns "[MM] Drop" into "LMM] Drop"
+# and "Hutchclutch211" into "Hutchclutch2ii". Unlike PreprocessConfig.pad (which fills with a
+# flat border colour) this recovers actual screen content. 4 px already fixed both misreads;
+# 12 px leaves room for a sloppier drag without pulling in much of the plate's frame.
+GRAB_MARGIN = 12
+
+
+def clamp_to_screen(region: Region, margin: int = GRAB_MARGIN) -> Region:
+    """`region` grown by `margin` on every side, clipped to the virtual screen."""
+    vs = virtual_screen()
     x, y, w, h = region
+    left = max(vs["left"], x - margin)
+    top = max(vs["top"], y - margin)
+    right = min(vs["left"] + vs["width"], x + w + margin)
+    bottom = min(vs["top"] + vs["height"], y + h + margin)
+    return (left, top, max(1, right - left), max(1, bottom - top))
+
+
+def grab(region: Region, margin: int = GRAB_MARGIN) -> Image.Image:
+    x, y, w, h = clamp_to_screen(region, margin)
     with mss.mss() as sct:
         shot = sct.grab({"left": x, "top": y, "width": w, "height": h})
     return Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")

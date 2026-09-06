@@ -24,7 +24,7 @@ sys.path.insert(0, str(ROOT))
 
 from PIL import Image  # noqa: E402
 
-from app import ocr  # noqa: E402
+from app import capture, ocr  # noqa: E402
 from app.db import Database, name_key  # noqa: E402
 
 SAMPLES = ROOT / "samples"
@@ -71,6 +71,15 @@ def rel_to_abs(rel: tuple[float, float, float, float], width: int) -> tuple[int,
     return (round(width - (r + w) * width), round(t * width), round(w * width), round(h * width))
 
 
+def _grow(region: tuple[int, int, int, int], margin: int, size: tuple[int, int]):
+    """`region` grown by `margin` on every side, clipped to the image -- capture.grab's margin."""
+    x, y, w, h = region
+    iw, ih = size
+    left, top = max(0, x - margin), max(0, y - margin)
+    right, bottom = min(iw, x + w + margin), min(ih, y + h + margin)
+    return (left, top, max(1, right - left), max(1, bottom - top))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--region", type=parse_region, help="x,y,w,h crop (default: region saved by the app)")
@@ -86,6 +95,9 @@ def main() -> int:
     ap.add_argument("--color", action="store_true", help="keep colour (skip grayscale)")
     ap.add_argument("--save-debug", action="store_true", help="write crops + preprocessed images to samples/_debug/")
     ap.add_argument("--save", action="store_true", help="persist these preprocessing options and engine for the app")
+    ap.add_argument("--margin", type=int, default=None,
+                    help=f"extra real pixels grabbed around --region, as the app does "
+                         f"(default {capture.GRAB_MARGIN}; use 0 to crop exactly)")
     ap.add_argument("--only", help="only process files whose name contains this text")
     args = ap.parse_args()
 
@@ -116,7 +128,8 @@ def main() -> int:
         print(f"No images found in {SAMPLES}. Drop some screenshots there first.")
         return 1
 
-    print(f"engine={args.engine}  region={region}  preprocess={cfg.to_dict()}")
+    margin = capture.GRAB_MARGIN if args.margin is None else args.margin
+    print(f"engine={args.engine}  region={region}  margin={margin}  preprocess={cfg.to_dict()}")
     t0 = time.perf_counter()
     engine = ocr.make_engine(args.engine)
     print(f"loaded {engine.name} in {time.perf_counter() - t0:.1f}s\n")
@@ -130,6 +143,8 @@ def main() -> int:
         img = Image.open(path).convert("RGB")
         crop = img
         file_region = rel_to_abs(args.rel_region, img.width) if args.rel_region else region
+        if file_region and not args.rel_region:
+            file_region = _grow(file_region, margin, img.size)
         if file_region:
             x, y, w, h = file_region
             if x + w <= img.width and y + h <= img.height:
