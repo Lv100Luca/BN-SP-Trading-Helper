@@ -10,13 +10,14 @@ import sys
 import threading
 import time
 import tkinter as tk
+import webbrowser
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
 from PIL import Image, ImageTk
 
-from . import __version__, capture, export, ocr, readings
+from . import REPO_URL, __version__, capture, export, ocr, readings
 from .db import STATES, Database, name_key
 
 STATE_LABELS = {"trading": "TRADING", "fighting": "FIGHTING", "afk": "AFK", "fake": "FAKE"}
@@ -107,14 +108,24 @@ class App(tk.Tk):
             self.readings_tab = ReadingsTab(self.nb, self)
             self.nb.add(self.readings_tab, text="   Readings   ")
         self.nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
-        ttk.Label(self, textvariable=self.status, anchor="w", relief="sunken", padding=(6, 3)).pack(
-            fill="x", side="bottom"
-        )
+        self._build_footer()
         self.bind("<F5>", lambda _e: self.home.read_name())
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.mini: MiniWindow | None = None
         if self.db.get_setting("mini_mode") == "1":
             self.after(200, self.enter_mini)
+
+    def _build_footer(self) -> None:
+        """Status text on the left; a small About section (version + GitHub link) on the right."""
+        footer = ttk.Frame(self, relief="sunken", padding=(6, 3))
+        footer.pack(fill="x", side="bottom")
+        about = ttk.Frame(footer)
+        about.pack(side="right", padx=(12, 0))
+        ttk.Label(about, text=f"Trade Check v{__version__}  ·", foreground="#666").pack(side="left")
+        link = ttk.Label(about, text="GitHub", foreground="#1565c0", cursor="hand2", font=("", 9, "underline"))
+        link.pack(side="left", padx=(4, 0))
+        link.bind("<Button-1>", lambda _e: webbrowser.open(REPO_URL))
+        ttk.Label(footer, textvariable=self.status, anchor="w").pack(side="left", fill="x", expand=True)
 
     # --------------------------------------------------------------- mini mode
     def enter_mini(self) -> None:
