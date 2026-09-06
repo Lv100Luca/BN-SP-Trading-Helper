@@ -1,7 +1,8 @@
 mss>=9.0
 Pillow>=10.0
 numpy>=1.26
-rapidocr_onnxruntime>=1.3
+rapidocr>=3.9,<4       # PP-OCRv6 (Latin/CJK) + per-script models; see app/ocr.py
+onnxruntime>=1.17      # rapidocr does not pull an inference engine in itself
 
 # Optional alternative OCR engine (also needs the tesseract binary installed):
 # pytesseract>=0.3

@@ -55,6 +55,24 @@ def ensure_icon() -> Path | None:
     return ICON
 
 
+def prefetch_models() -> None:
+    """Download the OCR models into the rapidocr package so --collect-all bundles them.
+
+    rapidocr fetches its .onnx files on first use into <site-packages>/rapidocr/models. A frozen
+    exe extracts to a fresh temp dir every run, so anything not bundled would be re-downloaded on
+    every start (and fail with no network). Instantiating the engine here pulls them in first.
+    """
+    sys.path.insert(0, str(ROOT))
+    from app import ocr
+
+    print("Fetching OCR models...")
+    engine = ocr.make_engine("rapidocr")
+    for grab in (getattr(engine, "_cyrillic", None),):  # second pass is lazy; force it too
+        if grab is not None:
+            grab()
+    print("OCR models ready.")
+
+
 def build(console: bool) -> int:
     for d in ("build", "dist"):
         try:
@@ -71,7 +89,7 @@ def build(console: bool) -> int:
     args = [
         sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--onefile",
         "--name", NAME,
-        "--collect-all", "rapidocr_onnxruntime",
+        "--collect-all", "rapidocr",
         "--collect-all", "onnxruntime",
         "--hidden-import", "PIL._tkinter_finder",
         "--exclude-module", "matplotlib",
@@ -137,6 +155,7 @@ def main() -> int:
     except ImportError:
         print("PyInstaller is not installed:  python -m pip install pyinstaller")
         return 1
+    prefetch_models()
     rc = build(console="--console" in sys.argv)
     if rc != 0:
         return rc

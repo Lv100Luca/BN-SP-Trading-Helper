@@ -37,4 +37,12 @@ relative crop works for every window size:
 (`R,T,W,H` as fractions of the image width; `R` is the gap between the crop's right edge and the
 image's right edge.) Measured 2026-09-05 on five screenshots: 5/5 loose matches, misses were only
 the "." / space in "Mr. Anomas". In the app, drag the region over the name text only, above the
-"Lvl." line, and re-select it if you move or resize the game window.
+"Lvl." line, and re-select it if you move or resize the game window. `capture.grab` adds a small
+real-pixel margin, so a slightly tight drag no longer clips the tops of the glyphs.
+
+## Scripts
+
+Names are read by two models (see `app/ocr.py`): PP-OCRv6 covers Latin, Japanese and Chinese, and
+a Cyrillic PP-OCRv5 model runs as a second pass only when the first is unsure -- neither model can
+read the other's script. Keep at least one sample per script in here so a tuning change that helps
+Latin cannot silently break the rest.

@@ -78,7 +78,13 @@ class OcrEngine(Protocol):
 
 
 class RapidOcrEngine:
-    """PaddleOCR models via ONNX runtime. pip install rapidocr_onnxruntime (no external binary)."""
+    """PaddleOCR models via ONNX runtime. pip install rapidocr (no external binary).
+
+    Runs up to two recognisers over the crop. No single bundled model covers every script a
+    player name can use: the default (Latin/CJK) recogniser reads Japanese fine but returns
+    nothing at all for Cyrillic, and the Cyrillic recogniser cannot read kana. So the Cyrillic
+    model is kept as a second pass, used only when the first one comes back empty or unsure.
+    """
 
     name = "rapidocr"
 
@@ -94,41 +100,83 @@ class RapidOcrEngine:
     # Nameplates are never rotated, so there is nothing for it to fix.
     USE_ANGLE_CLS = False
 
-    def __init__(self) -> None:
-        try:
-            from rapidocr_onnxruntime import RapidOCR  # type: ignore
+    # Second pass threshold. The default recogniser is confident (>=0.83 on every Latin and
+    # Japanese sample) and scores Cyrillic either at nothing or well under this, so a name below
+    # it is the only case worth paying for a second recognition pass.
+    FALLBACK_CONF = 0.75
 
+    def __init__(self) -> None:
+        self._legacy = False
+        self._fallback = None
+        try:
+            self._primary = self._new_engine()
+        except ImportError:
+            from rapidocr_onnxruntime import RapidOCR  # type: ignore  # 1.x, no per-script models
+
+            self._legacy = True
             try:
-                self._ocr = RapidOCR(
+                self._primary = RapidOCR(
                     det_model_path=None, det_limit_side_len=self.DET_LIMIT_SIDE, det_limit_type="max",
                     text_score=self.TEXT_SCORE, use_angle_cls=self.USE_ANGLE_CLS,
                 )
             except (TypeError, KeyError):  # other 1.x versions with a different override scheme
-                self._ocr = RapidOCR()
-        except ImportError:
-            from rapidocr import RapidOCR  # type: ignore  # newer package name
+                self._primary = RapidOCR()
 
-            try:
-                self._ocr = RapidOCR(params={
-                    "Det.limit_side_len": self.DET_LIMIT_SIDE, "Det.limit_type": "max",
-                    "Global.text_score": self.TEXT_SCORE, "Global.use_cls": self.USE_ANGLE_CLS,
-                })
-            except Exception:  # noqa: BLE001
-                self._ocr = RapidOCR()
+    def _new_engine(self, params: dict | None = None):
+        """A rapidocr >= 3 engine; `params` overrides pick the per-script recognition model."""
+        from rapidocr import RapidOCR  # type: ignore
 
-    def read(self, img: Image.Image) -> list[OcrLine]:
-        arr = np.ascontiguousarray(np.array(img.convert("RGB"))[:, :, ::-1])  # RGB -> BGR
-        out = self._ocr(arr)
+        return RapidOCR(params={
+            "Det.limit_side_len": self.DET_LIMIT_SIDE, "Det.limit_type": "max",
+            "Global.text_score": self.TEXT_SCORE, "Global.use_cls": self.USE_ANGLE_CLS,
+            **(params or {}),
+        })
+
+    def _cyrillic(self):
+        """Loaded on first use: most names are Latin and never need it."""
+        if self._fallback is None:
+            from rapidocr import LangRec, ModelType, OCRVersion  # type: ignore
+
+            self._fallback = self._new_engine({
+                "Rec.lang_type": LangRec.CYRILLIC, "Rec.ocr_version": OCRVersion.PPOCRV5,
+                "Rec.model_type": ModelType.MOBILE,
+            })
+        return self._fallback
+
+    @staticmethod
+    def _lines(out) -> list[OcrLine]:
         lines: list[OcrLine] = []
+        if out is None:
+            return lines
         if isinstance(out, tuple):  # rapidocr_onnxruntime: (result, elapse)
             for box, text, score in out[0] or []:
                 lines.append(OcrLine(str(text), float(score), _quad_to_box(box)))
-        elif out is not None and getattr(out, "txts", None) is not None:  # rapidocr >= 2
+        elif getattr(out, "txts", None) is not None:  # rapidocr >= 2
             boxes = out.boxes if getattr(out, "boxes", None) is not None else [None] * len(out.txts)
             for text, score, box in zip(out.txts, out.scores, boxes):
                 lines.append(OcrLine(str(text), float(score), _quad_to_box(box) if box is not None else None))
         return lines
 
+    def read(self, img: Image.Image) -> list[OcrLine]:
+        return self.read_passes(img)[0]
+
+    def read_passes(self, img: Image.Image) -> list[list[OcrLine]]:
+        """One list of lines per recognition model tried, best-first.
+
+        Kept separate rather than concatenated because merge_rows() would otherwise glue two
+        models' readings of the same row together ("Wonzgonz" + "Wonzgonz" -> "WonzgonzWonzgonz").
+        """
+        arr = np.ascontiguousarray(np.array(img.convert("RGB"))[:, :, ::-1])  # RGB -> BGR
+        groups = [self._lines(self._primary(arr))]
+        if self._legacy:
+            return groups
+        best = max((l.confidence for l in groups[0]), default=0.0)
+        if best < self.FALLBACK_CONF:
+            try:
+                groups.append(self._lines(self._cyrillic()(arr)))
+            except Exception:  # noqa: BLE001  # model download/load failure must not kill the read
+                pass
+        return groups
 
 class TesseractEngine:
     """Requires the tesseract binary on PATH plus `pip install pytesseract`."""
@@ -187,7 +235,7 @@ def make_engine(name: str = "auto") -> OcrEngine:
             errors.append(f"tesseract: {exc}")
     raise RuntimeError(
         "No OCR engine available (" + "; ".join(errors) + "). "
-        "Install one with: pip install rapidocr_onnxruntime"
+        "Install one with: pip install rapidocr onnxruntime"
     )
 
 
@@ -215,12 +263,16 @@ def _overlap(left: str, right: str, max_len: int = 3) -> int:
     return 0
 
 
-def merge_rows(lines: list[OcrLine], same_row: float = 0.5, glue_gap: float = 0.3) -> list[OcrLine]:
+def merge_rows(lines: list[OcrLine], same_row: float = 0.5, glue_gap: float = -0.15) -> list[OcrLine]:
     """Join fragments that sit on the same text row, left to right.
 
     Detectors often split a name at underscores or brackets ("Trader_Joe99" -> "Trader." + "Joe99").
     Fragments whose vertical centres differ by less than `same_row` x text height are one row;
     neighbours closer than `glue_gap` x text height are glued without a space.
+
+    `glue_gap` is negative because the detector pads every box it returns (unclip_ratio), so two
+    boxes with a real space between them still come back slightly overlapping: "[MM]" and "Drop"
+    overlap by 9 px on a 120 px line. Only a substantial overlap means one word was split in two.
     """
     boxed = [l for l in lines if l.box is not None]
     if len(boxed) < 2:
@@ -270,10 +322,23 @@ def pick_name(lines: list[OcrLine], min_conf: float = 0.0) -> tuple[str, float]:
 def read_name(
     img: Image.Image, engine: OcrEngine, cfg: PreprocessConfig | None = None
 ) -> tuple[str, float, list[OcrLine], Image.Image]:
-    """Full pipeline. Returns (name, confidence, all_lines, preprocessed_image)."""
+    """Full pipeline. Returns (name, confidence, all_lines, preprocessed_image).
+
+    An engine may offer several recognition models (see RapidOcrEngine.read_passes); each one
+    is merged and scored on its own and the most confident name wins.
+    """
     cfg = cfg or PreprocessConfig()
     processed = preprocess(img, cfg)
-    lines = merge_rows(engine.read(processed))
-    lines.sort(key=lambda l: l.confidence, reverse=True)
-    name, conf = pick_name(lines)
-    return name, conf, lines, processed
+    passes = getattr(engine, "read_passes", None)
+    groups = passes(processed) if passes is not None else [engine.read(processed)]
+
+    best: tuple[str, float, list[OcrLine]] = ("", 0.0, [])
+    for raw in groups:
+        lines = merge_rows(raw)
+        lines.sort(key=lambda l: l.confidence, reverse=True)
+        name, conf = pick_name(lines)
+        if name and conf > best[1]:
+            best = (name, conf, lines)
+        elif not best[2]:
+            best = (best[0], best[1], lines)
+    return best[0], best[1], best[2], processed
