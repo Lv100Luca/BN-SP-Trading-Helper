@@ -1065,17 +1065,18 @@ class RecordsTab(ttk.Frame):
 
         table = ttk.Frame(self)
         table.pack(fill="both", expand=True)
-        cols = ("name", "state", "source", "seen", "updated")
+        cols = ("name", "state", "notes", "source", "seen", "updated")
         self.tree = ttk.Treeview(table, columns=cols, show="headings", selectmode="extended")
         for col, text, width, anchor in (
             ("name", "Name", 220, "w"),
             ("state", "State", 90, "center"),
+            ("notes", "Notes", 200, "w"),
             ("source", "Source", 60, "center"),
             ("seen", "Seen", 60, "center"),
             ("updated", "Last updated", 150, "w"),
         ):
             self.tree.heading(col, text=text)
-            self.tree.column(col, width=width, anchor=anchor, stretch=(col == "name"))
+            self.tree.column(col, width=width, anchor=anchor, stretch=col in ("name", "notes"))
         for st in STATES:
             self.tree.tag_configure(st, foreground=STATE_COLORS[st])
         sb = ttk.Scrollbar(table, orient="vertical", command=self.tree.yview)
@@ -1127,7 +1128,7 @@ class RecordsTab(ttk.Frame):
             seen = r["times_seen"] or "-"
             self.tree.insert(
                 "", "end", iid=self._iid(r["source"], r["name"]),
-                values=(r["name"], STATE_LABELS[r["state"]], r["source"], seen, r["updated_at"]),
+                values=(r["name"], STATE_LABELS[r["state"]], r["notes"], r["source"], seen, r["updated_at"]),
                 tags=(r["state"],),
             )
         keep = [i for i in (self._iid(r["source"], r["name"]) for r in rows) if i in selected]

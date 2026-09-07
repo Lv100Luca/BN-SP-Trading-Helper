@@ -45,7 +45,8 @@ Python 3.10+ with tkinter (bundled on Windows/macOS; on Linux `sudo apt install 
    **TRADING / FIGHTING / AFK / FAKE**. The state becomes the current one and is added to the history.
    Misclicked? **Undo last save** takes the encounter back again (also on the mini HUD). Further clicks
    for the same name are ignored for 15 s (a countdown shows), so a double click cannot count twice.
-5. **Records** tab: search, filter by state, double-click to load a name into Home, change the state
+5. **Records** tab (name, state, notes, source, seen, last updated): search, filter by state, double-click
+   to load a name into Home, change the state
    (a correction, not an encounter), **Rename...** a record whose name OCR got wrong (merges into the
    right record if one exists), **Notes...** for a free-text note (also on Home; shown in the panel) or
    delete it. **Export...** saves your own records as JSON (or CSV for
