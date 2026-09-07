@@ -1514,7 +1514,7 @@ class MiniWindow(tk.Toplevel):
         note = rec["notes"] if (rec is not None and name) else ""
         if note:
             self.note_lbl.configure(text=note)
-            self.note_lbl.pack(fill="x", padx=6, after=self.state_lbl)
+            self.note_lbl.pack(fill="x", padx=6, pady=(3, 0), after=self.history)
         else:
             self.note_lbl.pack_forget()
         if not name:
