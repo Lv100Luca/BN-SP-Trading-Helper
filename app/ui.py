@@ -566,9 +566,11 @@ class HomeTab(ttk.Frame):
         row = ttk.Frame(self)
         row.pack(fill="x", pady=(6, 0))
         self.cooldown_var = tk.StringVar()
-        ttk.Label(row, textvariable=self.cooldown_var, foreground="#666").pack(side="left")
-        self.undo_btn = ttk.Button(row, text="Undo last save", command=self.undo_save, state="disabled")
+        # fixed button width and a wrapping label, so the countdown never changes the window width
+        self.undo_btn = ttk.Button(row, text="Undo last save", command=self.undo_save, state="disabled", width=30)
         self.undo_btn.pack(side="right")
+        ttk.Label(row, textvariable=self.cooldown_var, foreground="#666", wraplength=300, justify="left"
+                  ).pack(side="left", fill="x", expand=True)
         ttk.Button(row, text="Notes...", command=self.edit_notes).pack(side="right", padx=(0, 6))
 
     def note_typing(self) -> None:
@@ -900,9 +902,7 @@ class HomeTab(ttk.Frame):
             if self.app.mini is not None:
                 self.app.mini.set_cooldown(0)
             return
-        ls = self._last_save
-        self.cooldown_var.set(f"{ls['name']} saved as {STATE_LABELS[ls['state']]}. Clicks for this name are "
-                              f"ignored for {left:.0f} s (double click guard); misclick = Undo.")
+        self.cooldown_var.set(f"Double click guard: same name ignored for {left:.0f} s. Misclick? Undo.")
         if self.app.mini is not None:
             self.app.mini.set_cooldown(left)
         self.after(250, self._tick_cooldown)
