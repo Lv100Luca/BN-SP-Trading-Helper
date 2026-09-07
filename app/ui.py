@@ -56,13 +56,19 @@ def _overlaps(win: tk.Misc, region: capture.Region, min_fraction: float = 0.10) 
 
 
 class HistoryBar(tk.Canvas):
-    """State timeline as a strip of colored blocks, oldest left, newest right. Hover a block for
-    its time. Blocks are equal-width; a run of the same state reads as one wide bar."""
-    HEIGHT = 16
-    MAX_BLOCKS = 60
+    """State timeline as a strip of colored blocks, oldest left, newest right, with "oldest" /
+    "newest" captions underneath. Hover a block for its time. Blocks are equal-width, so a run
+    of the same state reads as one wide bar. With `slots` the strip always has room for that
+    many blocks and fills from the right (used by the mini HUD for the last 10 encounters)."""
+    BAR = 14
+    HEIGHT = BAR + 13
 
-    def __init__(self, master: tk.Misc, **kw) -> None:
+    def __init__(self, master: tk.Misc, max_blocks: int = 60, slots: int | None = None,
+                 caption_fg: str = "#888888", **kw) -> None:
         super().__init__(master, height=self.HEIGHT, highlightthickness=0, bd=0, **kw)
+        self.max_blocks = slots or max_blocks
+        self.slots = slots
+        self.caption_fg = caption_fg
         self._rows: list = []
         self._tip: tk.Toplevel | None = None
         self.bind("<Configure>", lambda _e: self._draw())
@@ -70,28 +76,41 @@ class HistoryBar(tk.Canvas):
         self.bind("<Leave>", lambda _e: self._hide_tip())
 
     def set(self, rows: list) -> None:
-        self._rows = list(rows)[-self.MAX_BLOCKS:]
+        self._rows = list(rows)[-self.max_blocks:]
         self._draw()
+
+    def _layout(self) -> tuple[int, float, int]:
+        """(number of slots, slot width, index of the first filled slot)."""
+        n = len(self._rows)
+        slots = self.slots or n
+        w = self.winfo_width()
+        return slots, (w / slots if slots else 0), slots - n
 
     def _draw(self) -> None:
         self.delete("all")
-        n = len(self._rows)
         w = self.winfo_width()
-        if not n or w < 10:
+        if not self._rows or w < 10:
             return
-        step = w / n
+        slots, step, first = self._layout()
         gap = 1 if step >= 4 else 0
         for i, r in enumerate(self._rows):
-            x0 = round(i * step)
-            x1 = max(x0 + 1, round((i + 1) * step) - gap)
-            self.create_rectangle(x0, 1, x1, self.HEIGHT - 1, fill=STATE_COLORS[r["state"]], outline="")
+            x0 = round((first + i) * step)
+            x1 = max(x0 + 1, round((first + i + 1) * step) - gap)
+            self.create_rectangle(x0, 1, x1, self.BAR - 1, fill=STATE_COLORS[r["state"]], outline="")
+        y = self.BAR + 6
+        self.create_text(1, y, text="oldest", anchor="w", fill=self.caption_fg, font=("", 7))
+        self.create_text(w - 1, y, text="newest >", anchor="e", fill=self.caption_fg, font=("", 7))
 
     def _hover(self, e: tk.Event) -> None:
-        n = len(self._rows)
         w = self.winfo_width()
-        if not n or w < 10:
+        if not self._rows or w < 10 or e.y > self.BAR:
+            self._hide_tip()
             return
-        i = min(n - 1, max(0, int(e.x * n / w)))
+        slots, step, first = self._layout()
+        i = int(e.x / step) - first
+        if not 0 <= i < len(self._rows):
+            self._hide_tip()
+            return
         r = self._rows[i]
         kind = {"edit": " (edited)", "import": " (imported)"}.get(r["kind"], "")
         self._show_tip(f"{STATE_LABELS[r['state']]}  {r['ts'][:16]}{kind}", e.x_root + 12, e.y_root + 12)
@@ -277,7 +296,10 @@ class App(tk.Tk):
             return
         self.withdraw()
         self.mini = MiniWindow(self)
-        self.mini.set_record(self.home.current_record, self.home.name_var.get().strip(), self.home.current_source)
+        if self.home.name_var.get().strip():
+            self.home.lookup(quiet=True)  # pushes record and history into the mini window
+        else:
+            self.mini.set_record(None, "", "")
         self.db.set_setting("mini_mode", "1")
 
     def exit_mini(self) -> None:
@@ -288,9 +310,9 @@ class App(tk.Tk):
         self.deiconify()
         self.lift()
 
-    def update_mini(self, rec, name: str, source: str = "local") -> None:
+    def update_mini(self, rec, name: str, source: str = "local", history: list = ()) -> None:
         if self.mini is not None:
-            self.mini.set_record(rec, name, source)
+            self.mini.set_record(rec, name, source, history)
 
     # ------------------------------------------------------------------ helpers
     def set_status(self, text: str) -> None:
@@ -669,9 +691,9 @@ class HomeTab(ttk.Frame):
         """`other` is the record from the source that did not win (shown as a hint), if any."""
         self.current_record = rec
         self.current_source = source if rec is not None else ""
-        self.app.update_mini(rec, name, self.current_source)
         own = rec if (rec is not None and source == "local") else other
-        self._show_history(own["name"] if own is not None else "")
+        rows = self._show_history(own["name"] if own is not None else "")
+        self.app.update_mini(rec, name, self.current_source, rows)
         if not name:
             self._paint_prev("No name read yet", "", bg=None, fg="black")
         elif rec is None:
@@ -695,7 +717,7 @@ class HomeTab(ttk.Frame):
                 bg=STATE_PALE[st], fg=STATE_COLORS[st],
             )
 
-    def _show_history(self, name: str) -> None:
+    def _show_history(self, name: str) -> list:
         rows = self.app.db.history(name) if name else []
         self.prev_history.set(rows)
         if len(rows) > 1:
@@ -704,6 +726,7 @@ class HomeTab(ttk.Frame):
             self.prev_history_lbl.configure(text="History: only this one sighting")
         else:
             self.prev_history_lbl.configure(text="")
+        return rows
 
     def _paint_prev(self, title: str, detail: str, bg: str | None, fg: str) -> None:
         bg = bg or self.app.cget("bg")
@@ -1206,6 +1229,7 @@ MINI_FG = "#f5f5f5"
 MINI_DIM = "#9e9e9e"
 MINI_STATE_FG = {"trading": "#66bb6a", "fighting": "#ef5350", "afk": "#bdbdbd", "fake": "#ffd54f"}
 MINI_NEW_FG = "#80d8ff"
+MINI_HISTORY = 10   # encounters shown on the mini HUD strip
 
 
 class MiniWindow(tk.Toplevel):
@@ -1238,6 +1262,8 @@ class MiniWindow(tk.Toplevel):
 
         self.state_lbl = tk.Label(self, text="", fg=MINI_DIM, bg=MINI_BG, font=("", 10, "bold"), anchor="w")
         self.state_lbl.pack(fill="x", padx=6)
+        self.history = HistoryBar(self, slots=MINI_HISTORY, caption_fg="#777777", bg=MINI_BG)
+        self.history.pack(fill="x", padx=6, pady=(3, 0))
 
         btns = tk.Frame(self, bg=MINI_BG)
         btns.pack(fill="x", padx=4, pady=4)
@@ -1252,7 +1278,7 @@ class MiniWindow(tk.Toplevel):
         foot = tk.Label(self, textvariable=app.home.auto_status, fg="#777777", bg=MINI_BG, font=("", 7), anchor="w")
         foot.pack(fill="x", padx=6, pady=(0, 3))
 
-        for w in (bar, self.name_lbl, self.state_lbl, btns, foot):  # not the buttons themselves
+        for w in (bar, self.name_lbl, self.state_lbl, self.history, btns, foot):  # not the buttons themselves
             w.bind("<ButtonPress-1>", self._drag_start)
             w.bind("<B1-Motion>", self._drag_move)
             w.bind("<ButtonRelease-1>", self._drag_end)
@@ -1262,7 +1288,8 @@ class MiniWindow(tk.Toplevel):
         self.update_idletasks()
         self.lift()
 
-    def set_record(self, rec, name: str, source: str = "local") -> None:
+    def set_record(self, rec, name: str, source: str = "local", history: list = ()) -> None:
+        self.history.set(history)
         if not name:
             self.state_lbl.configure(text="waiting for a name...", fg=MINI_DIM)
         elif rec is None:
