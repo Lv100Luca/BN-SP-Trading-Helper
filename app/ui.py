@@ -204,9 +204,12 @@ class App(tk.Tk):
             self.after(200, self.enter_mini)
         self._sync_results: queue.Queue = queue.Queue()
         self._sync_busy = False
+        self._push_busy = False
+        self._last_sync = time.monotonic()
         self._refresh_global_label()
         if sync.table_url():
             self.after(1500, self.refresh_global)  # let the window come up first
+            self.after(30_000, self._sync_tick)
 
     def _build_footer(self) -> None:
         """Last action on the left, version on the right. Everything else lives in the Settings tab."""
@@ -245,6 +248,25 @@ class App(tk.Tk):
         except queue.Empty:
             self.after(100, self._poll_sync)
             return
+        if kind in ("push_ok", "push_error"):
+            self._push_busy = False
+            self.settings.set_upload_enabled(True)
+            if kind == "push_error":
+                msg, then_fetch = payload
+                self.set_status(f"Upload to the global table failed: {msg}")
+            else:
+                ids, report, then_fetch = payload
+                self.db.clear_uploads(ids)
+                self.set_status(
+                    f"Uploaded {len(ids)} save(s) to the global table: {report.get('added', 0)} new, "
+                    f"{report.get('updated', 0)} changed, {report.get('unchanged', 0)} already known."
+                )
+            self.settings.refresh_pending_label()
+            if then_fetch:
+                self.refresh_global()
+            elif not self._sync_results.empty():
+                self.after(1, self._poll_sync)
+            return
         self._sync_busy = False
         self.settings.set_refresh_enabled(True)
         if kind == "error":
@@ -257,6 +279,73 @@ class App(tk.Tk):
             self.set_status(f"Global table updated: {n} names (v{payload.version}).")
         self._refresh_global_label()
         self.home.lookup(quiet=True)  # the name on screen may now have a global hit
+
+    # ------------------------------------------------------------ contributing
+    def sync_interval(self) -> int:
+        """Minutes between automatic uploads / downloads (1..15)."""
+        try:
+            return min(15, max(1, int(self.db.get_setting("sync_interval", "5") or 5)))
+        except ValueError:
+            return 5
+
+    def sharing(self) -> bool:
+        return self.db.get_setting("share_uploads") == "1" and bool(self.db.get_setting("contrib_key"))
+
+    def record_saved(self, name: str, state: str, notes: str = "") -> None:
+        """Called after every state save; queues it for the global table when sharing is on."""
+        if self.sharing():
+            self.db.queue_upload(name, state, notes)
+            self.settings.refresh_pending_label()
+
+    def _sync_tick(self) -> None:
+        self.after(30_000, self._sync_tick)
+        if time.monotonic() - self._last_sync < self.sync_interval() * 60:
+            return
+        self._last_sync = time.monotonic()
+        fetch = self.db.get_setting("auto_fetch") == "1"
+        if self.sharing() and self.db.pending_upload_count():
+            self.push_uploads(then_fetch=fetch)
+        elif fetch:
+            self.refresh_global()
+
+    def push_uploads(self, then_fetch: bool = False) -> None:
+        """Send the queued saves in a worker thread; the result is applied on the UI thread."""
+        url, key = sync.table_url(), self.db.get_setting("contrib_key", "") or ""
+        rows = self.db.pending_uploads()
+        if not url or not key or self._push_busy:
+            return
+        if not rows:
+            if then_fetch:
+                self.refresh_global()
+            return
+        self._push_busy = True
+        self.settings.set_upload_enabled(False)
+        ids = [r["id"] for r in rows]
+        records = [{"name": r["name"], "state": r["state"], "notes": r["notes"]} for r in rows]
+
+        def work() -> None:  # no tkinter or sqlite calls in here
+            try:
+                self._sync_results.put(("push_ok", (ids, sync.push_records(url, key, records), then_fetch)))
+            except sync.SyncError as exc:
+                self._sync_results.put(("push_error", (str(exc), then_fetch)))
+            except Exception as exc:  # noqa: BLE001
+                self._sync_results.put(("push_error", (f"{type(exc).__name__}: {exc}", then_fetch)))
+
+        threading.Thread(target=work, daemon=True).start()
+        self.after(100, self._poll_sync)
+
+    def _flush_on_exit(self) -> None:
+        """Best effort: push what is queued before the window goes away (short timeout)."""
+        rows = self.db.pending_uploads()
+        if not rows or not self.sharing():
+            return
+        try:
+            sync.push_records(sync.table_url(), self.db.get_setting("contrib_key", "") or "",
+                              [{"name": r["name"], "state": r["state"], "notes": r["notes"]} for r in rows],
+                              timeout=4)
+            self.db.clear_uploads(r["id"] for r in rows)
+        except Exception:  # noqa: BLE001  - stays queued for the next run
+            pass
 
     # --------------------------------------------------------------- mini mode
     def enter_mini(self) -> None:
@@ -320,6 +409,7 @@ class App(tk.Tk):
 
     def _on_close(self) -> None:
         self.home.stop_auto()
+        self._flush_on_exit()
         self.db.close()
         self.destroy()
 
@@ -711,6 +801,7 @@ class HomeTab(ttk.Frame):
             return
         prev = self.app.db.get(name)
         rec = self.app.db.upsert(name, state)
+        self.app.record_saved(rec["name"], state, rec["notes"])
         if self.app.log is not None and self.reading_id is not None:
             self.app.db.mark_reading_saved(self.reading_id, rec["name"], state)
         self._show_prev(rec, name, "local", other=self.app.db.get_global(name))
@@ -921,6 +1012,8 @@ class RecordsTab(ttk.Frame):
                 glob = self.app.db.get_global(name)
                 self.app.db.upsert(name, state, glob["notes"] if glob is not None else None)
                 adopted += 1
+            rec = self.app.db.get(name)
+            self.app.record_saved(name, state, rec["notes"] if rec is not None else "")
         self.refresh()
         if picked:
             extra = f" ({adopted} copied from the global table into your records)" if adopted else ""
@@ -978,6 +1071,8 @@ class SettingsTab(ttk.Frame):
             ttk.Label(box, text=f"Server: {sync.table_url()}   |   downloaded on start-up and on Refresh",
                       foreground="#666").pack(anchor="w", pady=(2, 0))
             self.refresh_global_label()
+            self._build_sync(box)
+            self._build_contribute()
 
         about = ttk.LabelFrame(self, text="About", padding=10)
         about.pack(fill="x", pady=(10, 0))
@@ -986,6 +1081,94 @@ class SettingsTab(ttk.Frame):
         link.pack(anchor="w", pady=(2, 0))
         link.bind("<Button-1>", lambda _e: webbrowser.open(REPO_URL))
         ttk.Label(about, text=f"Database: {self.app.db.path}", foreground="#666").pack(anchor="w", pady=(6, 0))
+
+    def _build_sync(self, box: ttk.LabelFrame) -> None:
+        db = self.app.db
+        row = ttk.Frame(box)
+        row.pack(fill="x", pady=(10, 0))
+        self.auto_fetch_var = tk.BooleanVar(value=db.get_setting("auto_fetch", "0") == "1")
+        ttk.Checkbutton(row, text="Auto-download the table", variable=self.auto_fetch_var,
+                        command=lambda: db.set_setting("auto_fetch", "1" if self.auto_fetch_var.get() else "0")
+                        ).pack(side="left")
+        ttk.Label(row, text="Sync interval:").pack(side="left", padx=(16, 4))
+        self.interval_var = tk.IntVar(value=self.app.sync_interval())
+        spin = ttk.Spinbox(row, from_=1, to=15, increment=1, width=4, textvariable=self.interval_var,
+                           command=self._set_interval)
+        spin.pack(side="left")
+        spin.bind("<FocusOut>", lambda _e: self._set_interval())
+        spin.bind("<Return>", lambda _e: self._set_interval())
+        ttk.Label(row, text="min  (downloads and uploads)").pack(side="left", padx=(4, 0))
+
+    def _build_contribute(self) -> None:
+        db = self.app.db
+        box = ttk.LabelFrame(self, text="Contribute to the global table", padding=10)
+        box.pack(fill="x", pady=(10, 0))
+        ttk.Label(box, text="With a contributor key from the table admin your saves are uploaded and "
+                            "merged into the shared table on the sync interval (and when the app closes).",
+                  foreground="#666", wraplength=720, justify="left").pack(anchor="w")
+        row = ttk.Frame(box)
+        row.pack(fill="x", pady=(8, 0))
+        ttk.Label(row, text="Contributor key:").pack(side="left")
+        self.key_var = tk.StringVar(value=db.get_setting("contrib_key", "") or "")
+        self.key_entry = ttk.Entry(row, textvariable=self.key_var, show="*", width=52)
+        self.key_entry.pack(side="left", padx=(6, 0))
+        self.show_key_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row, text="show", variable=self.show_key_var,
+                        command=lambda: self.key_entry.configure(show="" if self.show_key_var.get() else "*")
+                        ).pack(side="left", padx=(6, 0))
+        ttk.Button(row, text="Save key", command=self._save_key).pack(side="left", padx=(6, 0))
+        row = ttk.Frame(box)
+        row.pack(fill="x", pady=(8, 0))
+        self.share_var = tk.BooleanVar(value=db.get_setting("share_uploads", "0") == "1")
+        ttk.Checkbutton(row, text="Upload my saves", variable=self.share_var, command=self._toggle_share
+                        ).pack(side="left")
+        self.pending_var = tk.StringVar()
+        ttk.Label(row, textvariable=self.pending_var, foreground="#666").pack(side="left", padx=(16, 0))
+        self.upload_btn = ttk.Button(row, text="Upload now", command=self.app.push_uploads)
+        self.upload_btn.pack(side="right")
+        self.refresh_pending_label()
+
+    def _set_interval(self) -> None:
+        try:
+            minutes = min(15, max(1, int(self.interval_var.get())))
+        except (tk.TclError, ValueError):
+            minutes = 5
+        self.interval_var.set(minutes)
+        self.app.db.set_setting("sync_interval", str(minutes))
+
+    def _save_key(self) -> None:
+        key = self.key_var.get().strip()
+        self.key_var.set(key)
+        self.app.db.set_setting("contrib_key", key)
+        self.app.set_status("Contributor key saved." if key else "Contributor key removed.")
+        self.refresh_pending_label()
+
+    def _toggle_share(self) -> None:
+        on = self.share_var.get()
+        self.app.db.set_setting("share_uploads", "1" if on else "0")
+        if on and not (self.app.db.get_setting("contrib_key") or ""):
+            self.app.set_status("Enter and save a contributor key first; saves are queued once one is set.")
+        self.refresh_pending_label()
+
+    def refresh_pending_label(self) -> None:
+        if not hasattr(self, "pending_var"):
+            return
+        n = self.app.db.pending_upload_count()
+        if not self.share_var.get():
+            text = "Uploads off." if not n else f"Uploads off; {n} save(s) still queued."
+        elif not (self.app.db.get_setting("contrib_key") or ""):
+            text = "No key saved."
+        else:
+            text = "Nothing queued." if not n else f"{n} save(s) queued for the next upload."
+        self.pending_var.set(text)
+        self.upload_btn.configure(state="normal" if (n and self.app.sharing()) else "disabled")
+
+    def set_upload_enabled(self, on: bool) -> None:
+        if hasattr(self, "upload_btn"):
+            if on:
+                self.refresh_pending_label()
+            else:
+                self.upload_btn.configure(state="disabled")
 
     def _set_preference(self) -> None:
         pref = self.prefer_var.get()

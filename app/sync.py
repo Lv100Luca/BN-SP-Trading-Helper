@@ -3,7 +3,9 @@
 
 The whole table comes down in one GET; the app keeps a copy in the local database
 (Database.replace_global) and answers lookups from there, so reading a name never touches the
-network. Fetched once at start-up and whenever the Refresh button in the footer is pressed.
+network. Fetched once at start-up, on Refresh in the Settings tab and, when auto-download is on,
+every sync interval. Contributors with a key push their queued saves (push_records) on the same
+interval.
 """
 from __future__ import annotations
 
@@ -33,7 +35,11 @@ class Fetched:
 
 
 class SyncError(Exception):
-    """Human-readable reason the table could not be fetched."""
+    """Human-readable reason the table could not be fetched or written."""
+
+
+class AuthError(SyncError):
+    """The server rejected the contributor key."""
 
 
 def fetch_table(url: str, etag: str = "") -> Fetched:
@@ -62,3 +68,28 @@ def fetch_table(url: str, etag: str = "") -> Fetched:
     if not isinstance(records, list):
         raise SyncError("unexpected response from the server")
     return Fetched("updated", new_etag, int(payload.get("version", 0)), str(payload.get("updated_at", "")), records)
+
+
+def push_records(url: str, key: str, records: list[dict], timeout: float = TIMEOUT) -> dict:
+    """Blocking POST of saves ({name, state, notes}) with a contributor key. Returns the server's
+    report (added / updated / unchanged / skipped / version). Safe to call from a worker thread."""
+    body = json.dumps({"records": records}, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        url + "/v1/records", data=body, method="POST",
+        headers={"Content-Type": "application/json", "Accept": "application/json",
+                 "Authorization": f"Bearer {key}", "User-Agent": f"TradeCheck/{__version__}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            raise AuthError("the server rejected your contributor key") from exc
+        if exc.code == 429:
+            wait = exc.headers.get("Retry-After", "a minute")
+            raise SyncError(f"server is rate limiting uploads, try again in {wait}s") from exc
+        raise SyncError(f"server answered {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        raise SyncError(f"could not reach the server ({exc.reason})") from exc
+    except (OSError, ValueError) as exc:
+        raise SyncError(str(exc)) from exc

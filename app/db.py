@@ -97,6 +97,13 @@ CREATE TABLE IF NOT EXISTS sightings (        -- state timeline per record, olde
     kind      TEXT NOT NULL DEFAULT 'seen'    -- 'seen' (saved on Home), 'edit' (Records tab), 'import'
 );
 CREATE INDEX IF NOT EXISTS idx_sightings_record ON sightings(record_id, ts);
+CREATE TABLE IF NOT EXISTS pending_uploads (  -- saves waiting to be pushed to the global table
+    id    INTEGER PRIMARY KEY,
+    name  TEXT NOT NULL,
+    state TEXT NOT NULL,
+    notes TEXT NOT NULL DEFAULT '',
+    ts    TEXT NOT NULL
+);
 """
 
 
@@ -475,6 +482,27 @@ class Database:
                     (key, str(value)),
                 )
         return len(rows)
+
+    # Contributors (Settings tab: key + "upload my saves") queue every save here; App flushes the
+    # queue to the server on the sync interval and on exit.
+    def queue_upload(self, name: str, state: str, notes: str = "") -> None:
+        self.conn.execute(
+            "INSERT INTO pending_uploads (name, state, notes, ts) VALUES (?, ?, ?, ?)",
+            (normalize_name(name), state, notes or "", _now()),
+        )
+        self.conn.commit()
+
+    def pending_uploads(self) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM pending_uploads ORDER BY id").fetchall()
+
+    def pending_upload_count(self) -> int:
+        return self.conn.execute("SELECT COUNT(*) FROM pending_uploads").fetchone()[0]
+
+    def clear_uploads(self, ids: Iterable[int]) -> None:
+        ids = list(ids)
+        if ids:
+            self.conn.executemany("DELETE FROM pending_uploads WHERE id = ?", [(i,) for i in ids])
+            self.conn.commit()
 
     def touch_global(self) -> None:
         """The server said our copy is still current: only bump the sync time."""
