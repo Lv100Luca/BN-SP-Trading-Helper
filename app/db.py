@@ -90,7 +90,7 @@ CREATE TABLE IF NOT EXISTS pending_uploads (  -- saves waiting to be pushed to t
     state    TEXT NOT NULL,
     notes    TEXT NOT NULL DEFAULT '',
     ts       TEXT NOT NULL,                   -- UTC, the server keeps it; Undo retracts by it
-    kind     TEXT NOT NULL DEFAULT 'seen',    -- seen | edit | retract | rename
+    kind     TEXT NOT NULL DEFAULT 'seen',    -- seen | edit | note | retract | rename
     new_name TEXT NOT NULL DEFAULT ''         -- rename only
 );
 """
@@ -249,23 +249,10 @@ class Database:
             ).fetchone()
         return row
 
-    def lookup_preference(self) -> str:
-        """Which source wins when a name is in both tables: "local" (default) or "global"."""
-        return "global" if self.get_setting("lookup_prefer") == "global" else "local"
-
     def find_both(self, name: str) -> tuple[sqlite3.Row | None, sqlite3.Row | None]:
+        """Your own record and the shared table's entry for `name`; either can be None. The UI shows
+        the two side by side, so no source ever hides the other."""
         return self.get(name), self.get_global(name)
-
-    def find(self, name: str, prefer: str | None = None) -> tuple[sqlite3.Row | None, str]:
-        """The record from the preferred source, the other one as fallback.
-        Returns (row, "local" | "global" | "")."""
-        local, glob = self.find_both(name)
-        prefer = prefer or self.lookup_preference()
-        order = ((glob, "global"), (local, "local")) if prefer == "global" else ((local, "local"), (glob, "global"))
-        for rec, source in order:
-            if rec is not None:
-                return rec, source
-        return None, ""
 
     def upsert(self, name: str, state: str, notes: str | None = None) -> sqlite3.Row:
         """Record an encounter: insert, or overwrite state and bump times_seen."""
@@ -493,8 +480,7 @@ class Database:
 
     # ------------------------------------------------------------- global table
     # A copy of the shared read-only table the server hands out (app/sync.py fetches it; only
-    # replace_global() writes here). find() consults it before or after your own records
-    # depending on the lookup preference.
+    # replace_global() writes here). find_both() hands it out next to your own record.
     def get_global(self, name: str) -> sqlite3.Row | None:
         name = normalize_name(name)
         if not name:
@@ -554,7 +540,8 @@ class Database:
 
     # Contributors (Settings tab: key + "upload my saves") queue every save here; App flushes the
     # queue to the server on the sync interval and on exit. kind: "seen" (an encounter), "edit"
-    # (Records tab), "retract" (Undo of a pushed save, same name and ts) or "rename" (name -> new_name).
+    # (Records tab), "note" (Notes dialog; the only kind whose notes the server reads), "retract"
+    # (Undo of a pushed save, same name and ts) or "rename" (name -> new_name).
     def queue_upload(self, name: str, state: str, notes: str = "", kind: str = "seen",
                      ts: str | None = None, new_name: str = "") -> tuple[int, str]:
         """Returns (row id, ts) so a save can be undone: dropped from the queue, or retracted by ts."""

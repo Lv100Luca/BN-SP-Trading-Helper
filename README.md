@@ -36,9 +36,11 @@ Python 3.10+ with tkinter (bundled on Windows/macOS; on Linux `sudo apt install 
    unchanged and only switches to a new name after two consistent reads, so a flickering frame cannot
    flip it. The grey line under READ NAME shows what auto-read last saw. **READ NAME** / F5 always does
    a one-off read.
-3. The panel shows the **previous record** for that name (state, times seen, first/last date) and its
-   **history**: a strip of coloured blocks, one per encounter, oldest left, with the share of each state
-   underneath. Hover a block for its time. Or "no previous record".
+3. The panel shows everything known about that name, from both sources at once: a line for **your own
+   record** (state, times seen, first/last) and one for **everyone** (the shared table: state, encounters,
+   last sighting), both **notes** when they differ, and both **histories** as strips of coloured blocks,
+   one per sighting, oldest left, with the share of each state. Hover a block for its time. The headline
+   and colour follow whichever source changed last. Or "no previous record".
 4. Fix the name in the text box if OCR got it slightly wrong (auto-read pauses while you type), then click
    **TRADING / FIGHTING / AFK / FAKE**. The state becomes the current one and is added to the history.
    Misclicked? **Undo last save** takes the encounter back again (also on the mini HUD). Further clicks
@@ -78,18 +80,20 @@ Besides your own records the app consults a shared lookup table hosted on a smal
 ([BN-SP-Trading-Helper-API](https://github.com/Lv100Luca/BN-SP-Trading-Helper-API): one Python
 file, deployed to the VPS by its CI). The client downloads the whole table at start-up, on
 **Refresh now** in the Settings tab and, with **Auto-download** ticked, every sync interval; it keeps the
-copy in the local database and looks names up offline. A name that is only in the table shows up in a
-blue panel marked *global table*, with the table's history. Which source wins when a name is in both is
-the **Preferred source** setting (default: your own records; the other one is shown as a hint). The
-Records tab lists both (**Source** filter); setting a state on a global row copies it into your records.
+copy in the local database and looks names up offline. Home and the mini HUD show your own record and
+the table's entry side by side (states, notes, histories), so nothing one source knows is hidden by the
+other. The Records tab lists both (**Source** filter) and shows both histories of the selected name;
+setting a state on a global row copies it, note included, into your records, as does the first save of
+a name you only knew from the table.
 
 **Contributing.** With a contributor key from the table admin (`tools/manage_keys.py <server url>
 create "Name"`, printed once) your saves go into the shared table: paste the key in Settings, **Save
 key** (the app checks it with the server first and only keeps a working one), tick **Upload my saves**.
 Every save, correction, undo and rename is queued and pushed on the sync interval, on **Upload now** and
 when the app closes. On the server each save is one sighting in that name's history; Undo takes your own
-sighting back again, Rename moves your sightings to the right name. You can only ever change what you
-uploaded yourself. A revoked key switches uploads off with a red note in Settings; **Discard queued**
+sighting back again, Rename moves your sightings to the right name. Notes travel separately: only the
+**Notes...** dialog changes the shared note (an empty note clears it), a state save never carries one.
+You can only ever change what you uploaded yourself. A revoked key switches uploads off with a red note in Settings; **Discard queued**
 throws away changes that have not been pushed yet.
 
 The admin can also replace the whole table with an export: `tools/publish_global.py <server url>

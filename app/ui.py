@@ -23,7 +23,6 @@ STATE_LABELS = {"trading": "TRADING", "fighting": "FIGHTING", "afk": "AFK", "fak
 STATE_COLORS = {"trading": "#2e7d32", "fighting": "#c62828", "afk": "#616161", "fake": "#f9a825"}
 STATE_FG = {"trading": "white", "fighting": "white", "afk": "white", "fake": "#212121"}  # button text
 STATE_PALE = {"trading": "#e8f5e9", "fighting": "#ffebee", "afk": "#eeeeee", "fake": "#fff8e1"}
-GLOBAL_PALE = "#e3f2fd"   # previous-record panel when the state comes from the shared table
 PREVIEW_MAX = (520, 140)
 MIN_SIZE = (640, 520)   # smallest window; also the size on first start (the last size is restored later)
 SAVE_COOLDOWN = 15   # seconds the double click guard ignores clicks for the same name (packaged app)
@@ -138,6 +137,58 @@ def history_summary(rows: list) -> str:
     total = sum(counts.values()) or 1
     ranked = sorted(counts.items(), key=lambda kv: (-kv[1], STATES.index(kv[0])))
     return "  |  ".join(f"{st} {round(100 * n / total)}%" for st, n in ranked)
+
+
+def newest(local, glob):
+    """Of your own record and the shared table's entry, the one changed most recently (yours on a
+    tie or when only one exists). Decides the headline state and colour of a panel."""
+    if local is None or glob is None:
+        return local if local is not None else glob
+    return glob if glob["updated_at"] > local["updated_at"] else local
+
+
+def notes_text(local, glob, you: str = "Your note", shared: str = "Shared note", both: str = "Note") -> str:
+    """Both sources' notes, labelled, so neither is ever hidden; one line when they agree."""
+    mine = local["notes"] if local is not None else ""
+    theirs = glob["notes"] if glob is not None else ""
+    if mine and theirs:
+        return f"{both}: {mine}" if mine == theirs else f"{you}: {mine}\n{shared}: {theirs}"
+    return f"{you}: {mine}" if mine else (f"{shared}: {theirs}" if theirs else "")
+
+
+class HistoryPanel(tk.Frame):
+    """Your own timeline and the shared table's, stacked and labelled ("You" / "Everyone"), so a
+    block never needs a footnote to say whose sighting it is. A strip without rows is hidden."""
+
+    def __init__(self, master: tk.Misc, slots: int | None = None, caption_fg: str = "#888888",
+                 who: tuple[str, str] = ("You", "Everyone"), font=("", 8), fg: str = "#444444", **kw) -> None:
+        super().__init__(master, **kw)
+        self.who = who
+        self.rows: list[tuple[tk.Label, HistoryBar]] = []
+        for _ in who:
+            lbl = tk.Label(self, text="", anchor="w", font=font)
+            bar = HistoryBar(self, slots=slots, caption_fg=caption_fg)
+            self.rows.append((lbl, bar))
+        self.recolor(self.cget("bg"), fg)
+
+    def set(self, local_rows: list, global_rows: list) -> None:
+        for (lbl, bar), who, rows in zip(self.rows, self.who, (local_rows, global_rows)):
+            lbl.pack_forget()
+            bar.pack_forget()
+            if not rows:
+                continue
+            bar.set(rows)
+            n = len(rows)
+            summary = f"  -  {history_summary(rows)}" if n > 1 else ""
+            lbl.configure(text=f"{who}: {n} sighting{'s' if n != 1 else ''}{summary}")
+            lbl.pack(fill="x", pady=(4, 0))
+            bar.pack(fill="x")
+
+    def recolor(self, bg: str, fg: str) -> None:
+        self.configure(bg=bg)
+        for lbl, bar in self.rows:
+            lbl.configure(bg=bg, fg=fg)
+            bar.configure(bg=bg)
 
 
 def autowrap(label: tk.Misc, pad: int = 4) -> None:
@@ -269,7 +320,8 @@ class App(tk.Tk):
                 ids, report, then_fetch = payload
                 self.db.clear_uploads(ids)
                 extra = "".join(
-                    f", {report[k]} {what}" for k, what in (("retracted", "taken back"), ("renamed", "renamed"))
+                    f", {report[k]} {what}" for k, what in (("retracted", "taken back"), ("renamed", "renamed"),
+                                                            ("noted", "note(s) changed"))
                     if report.get(k)
                 )
                 self.set_status(
@@ -322,7 +374,8 @@ class App(tk.Tk):
                      new_name: str = "") -> tuple[int | None, str | None]:
         """Called after every change to a record; queues it for the global table when sharing is on.
         kind "seen" is an encounter (Home), "edit" a correction and "rename" a fix of the name
-        (Records tab). Returns the queue row's (id, ts), or (None, None) when nothing was queued."""
+        (Records tab), "note" a changed note (the only kind that carries `notes`; the server ignores
+        notes on the others). Returns the queue row's (id, ts), or (None, None) when nothing was queued."""
         if not self.sharing():
             return None, None
         upload_id, ts = self.db.queue_upload(name, state, notes, kind, new_name=new_name)
@@ -338,7 +391,7 @@ class App(tk.Tk):
 
     def edit_notes(self, name: str, parent: tk.Misc) -> bool:
         """Dialog for the notes of your own record `name`. Contributors' notes go to the global table
-        as an edit (the server keeps the newest non-empty note). True when something changed."""
+        as a "note" row (an empty one clears the shared note). True when something changed."""
         rec = self.db.get(name)
         if rec is None:
             messagebox.showinfo("Notes", f"'{name}' has no record of yours yet. Save a state first.", parent=parent)
@@ -353,7 +406,7 @@ class App(tk.Tk):
         if new == rec["notes"]:
             return False
         self.db.set_notes(rec["name"], new)
-        self.record_saved(rec["name"], rec["state"], new, kind="edit")
+        self.record_saved(rec["name"], rec["state"], new, kind="note")
         self.set_status(f"{rec['name']}: notes {'saved' if new else 'removed'}.")
         return True
 
@@ -437,7 +490,7 @@ class App(tk.Tk):
         if self.home.name_var.get().strip():
             self.home.lookup(quiet=True)  # pushes record and history into the mini window
         else:
-            self.mini.set_record(None, "", "")
+            self.mini.set_record("", None, None, [], [])
         self.db.set_setting("mini_mode", "1")
 
     def exit_mini(self) -> None:
@@ -448,9 +501,9 @@ class App(tk.Tk):
         self.deiconify()
         self.lift()
 
-    def update_mini(self, rec, name: str, source: str = "local", history: list = ()) -> None:
+    def update_mini(self, name: str, local, glob, local_rows: list, global_rows: list) -> None:
         if self.mini is not None:
-            self.mini.set_record(rec, name, source, history)
+            self.mini.set_record(name, local, glob, local_rows, global_rows)
 
     # ------------------------------------------------------------------ helpers
     def set_status(self, text: str) -> None:
@@ -507,8 +560,6 @@ class HomeTab(ttk.Frame):
         self._preview_img: ImageTk.PhotoImage | None = None
         self._busy = False
         self._results: queue.Queue = queue.Queue()  # worker thread -> UI thread hand-off
-        self.current_record = None      # sqlite3.Row shown in the previous-record panel (or None)
-        self.current_source = ""        # "local" (your records), "global" (shared table) or ""
         self._typing_until = 0.0        # auto-read leaves the name box alone until this time
         self._auto_job: str | None = None
         self._auto_run = False          # is the OCR currently in flight an auto-read?
@@ -561,22 +612,19 @@ class HomeTab(ttk.Frame):
         self.name_entry = entry
         ttk.Button(row, text="Lookup", command=self.lookup).pack(side="left")
 
+        # Previous-record panel: headline, one line per source (you / everyone), both notes, both
+        # timelines. Nothing one source knows is hidden behind the other.
         self.prev_frame = tk.Frame(self, bd=2, relief="ridge", padx=10, pady=10)
         self.prev_frame.pack(fill="x", pady=6)
-        self.prev_top = tk.Frame(self.prev_frame)
-        self.prev_top.pack(fill="x")
-        self.prev_title = tk.Label(self.prev_top, text="No name read yet", font=("", 13, "bold"), anchor="w")
-        self.prev_title.pack(side="left", fill="x", expand=True)
-        self.prev_history_lbl = tk.Label(self.prev_top, text="", anchor="e", font=("", 8))
-        self.prev_history_lbl.pack(side="right", anchor="s")
+        self.prev_title = tk.Label(self.prev_frame, text="No name read yet", font=("", 13, "bold"), anchor="w")
+        self.prev_title.pack(fill="x")
         self.prev_detail = tk.Label(self.prev_frame, text="", justify="left", anchor="w")
         self.prev_detail.pack(fill="x")
         autowrap(self.prev_detail)
-        self.prev_history = HistoryBar(self.prev_frame)
-        self.prev_history.pack(fill="x", pady=(6, 0))
         self.prev_notes = tk.Label(self.prev_frame, text="", justify="left", anchor="w")
-        self.prev_notes.pack(fill="x")
         autowrap(self.prev_notes)
+        self.prev_history = HistoryPanel(self.prev_frame)
+        self.prev_history.pack(fill="x", pady=(2, 0))
 
         ttk.Label(self, text="Record the current state (added to this player's history):").pack(anchor="w", pady=(8, 2))
         row = ttk.Frame(self)
@@ -850,75 +898,61 @@ class HomeTab(ttk.Frame):
         self.lookup()
 
     def lookup(self, quiet: bool = False) -> None:
-        """Show the record for the name in the box from the preferred source (footer setting), the
-        other source as fallback. `quiet` re-runs the lookup after a global table refresh or a
-        preference change and does nothing when the box is empty."""
+        """Show your own record and the shared table's entry for the name in the box, side by side.
+        `quiet` re-runs the lookup after a global table refresh and does nothing when the box is empty."""
         name = self.name_var.get().strip()
         if quiet and not name:
             return
         if not name:
-            self._show_prev(None, name, "")
+            self._show_prev("", None, None)
             return
         local, glob = self.app.db.find_both(name)
-        rec, source = self.app.db.find(name)
-        self._show_prev(rec, name, source, other=(glob if source == "local" else local))
+        self._show_prev(name, local, glob)
 
-    def _show_prev(self, rec, name: str, source: str = "local", other=None) -> None:
-        """`other` is the record from the source that did not win (shown as a hint), if any."""
-        self.current_record = rec
-        self.current_source = source if rec is not None else ""
-        rows = self._show_history(rec, source, other)
-        self.app.update_mini(rec, name, self.current_source, rows)
+    def _show_prev(self, name: str, local, glob) -> None:
+        """Paint the panel from both sources: `local` is your own record, `glob` the shared table's
+        entry (either may be None). Headline and colour follow whichever changed last."""
+        lrows = self.app.db.history(local["name"]) if local is not None else []
+        grows = self.app.db.global_history(glob["name"]) if glob is not None else []
+        self.app.update_mini(name, local, glob, lrows, grows)
+        self.prev_history.set(lrows, grows)
         if not name:
             self._paint_prev("No name read yet", "", bg=None, fg="black")
-        elif rec is None:
+            return
+        if local is None and glob is None:
             self._paint_prev(f"{name}: no previous record", "First time seeing this player.", bg="#fff8e1", fg="#795548")
-        elif source == "global":
-            st = rec["state"]
-            own = (f"Your own record: {STATE_LABELS[other['state']]} (seen {other['times_seen']}x)"
-                   if other is not None else "Not in your own records")
-            self._paint_prev(
-                f"{rec['name']}: {STATE_LABELS[st]} in the global table",
-                f"{own}   |   table entry from {rec['updated_at'][:10]}",
-                bg=GLOBAL_PALE, fg=STATE_COLORS[st], notes=rec["notes"],
-            )
+            return
+        head = newest(local, glob)
+        st = head["state"]
+        title = f"{head['name']}: {STATE_LABELS[st]}"
+        if local is not None and glob is not None and local["state"] != glob["state"]:
+            title += "  (yours)" if head is local else "  (shared, newer)"
+        if local is not None:
+            lines = [f"You: {STATE_LABELS[local['state']]}  -  seen {local['times_seen']}x  -  "
+                     f"first {local['created_at'][:16]}  -  last {local['updated_at'][:16]}"]
         else:
-            st = rec["state"]
-            hint = f"   |   global table: {STATE_LABELS[other['state']]}" if other is not None else ""
-            self._paint_prev(
-                f"{rec['name']}: previously {STATE_LABELS[st]}",
-                f"Seen {rec['times_seen']}x   |   first {rec['created_at']}   |   last {rec['updated_at']}{hint}",
-                bg=STATE_PALE[st], fg=STATE_COLORS[st], notes=rec["notes"],
-            )
-
-    def _show_history(self, rec, source: str, other=None) -> list:
-        """Timeline of the record that won the lookup; the other source's when the winner has none."""
-        rows, where = [], ""
-        for r, src in ((rec, source), (other, "global" if source == "local" else "local")):
-            if r is None:
-                continue
-            rows = self.app.db.history(r["name"]) if src == "local" else self.app.db.global_history(r["name"])
-            where = "" if src == "local" else " (global table)"
-            if rows:
-                break
-        self.prev_history.set(rows)
-        if len(rows) > 1:
-            self.prev_history_lbl.configure(text=f"History{where} ({len(rows)}): {history_summary(rows)}")
-        elif rows:
-            self.prev_history_lbl.configure(text=f"History{where}: only this one sighting")
-        else:
-            self.prev_history_lbl.configure(text="")
-        return rows
+            lines = ["You: no record of your own yet"]
+        if sync.table_url():
+            if glob is not None:
+                last = grows[-1]["ts"] if grows else glob["updated_at"]
+                lines.append(f"Everyone: {STATE_LABELS[glob['state']]}  -  {glob['times_seen']} encounter(s)"
+                             f"  -  last {last[:16]}")
+            else:
+                lines.append("Everyone: not in the global table")
+        self._paint_prev(title, "\n".join(lines), bg=STATE_PALE[st], fg=STATE_COLORS[st], notes=notes_text(local, glob))
 
     def _paint_prev(self, title: str, detail: str, bg: str | None, fg: str, notes: str = "") -> None:
         bg = bg or self.app.cget("bg")
-        for w in (self.prev_frame, self.prev_top, self.prev_title, self.prev_detail, self.prev_history,
-                  self.prev_history_lbl, self.prev_notes):
+        for w in (self.prev_frame, self.prev_title, self.prev_detail, self.prev_notes):
             w.configure(bg=bg)
+        self.prev_history.recolor(bg, fg)
         self.prev_title.configure(text=title, fg=fg)
         self.prev_detail.configure(text=detail, fg=fg)
-        self.prev_history_lbl.configure(fg=fg)
-        self.prev_notes.configure(text=notes or "", fg=fg)
+        self.prev_notes.configure(text=notes, fg=fg)
+        if notes:
+            self.prev_notes.pack(fill="x", after=self.prev_detail)
+        else:
+            self.prev_notes.pack_forget()
 
     def save_state(self, state: str) -> None:
         name = self.name_var.get().strip()
@@ -932,8 +966,10 @@ class HomeTab(ttk.Frame):
                                 f"counts in {self._cooldown_left():.0f} s. Misclick? Undo it.")
             return
         prev = self.app.db.get(name)
-        rec = self.app.db.upsert(name, state)
-        upload_id, ts = self.app.record_saved(rec["name"], state, rec["notes"])
+        glob = self.app.db.get_global(name)
+        # a first record of your own starts with the shared note, so saving never hides it
+        rec = self.app.db.upsert(name, state, glob["notes"] if prev is None and glob is not None else None)
+        upload_id, ts = self.app.record_saved(rec["name"], state)
         self._last_save = {
             "name": rec["name"], "state": state, "prev": dict(prev) if prev is not None else None,
             "sighting_id": self.app.db.last_sighting_id(rec["id"]), "upload_id": upload_id, "ts": ts,
@@ -941,7 +977,7 @@ class HomeTab(ttk.Frame):
         }
         self._refresh_undo()
         self._tick_cooldown()
-        self._show_prev(rec, name, "local", other=self.app.db.get_global(name))
+        self._show_prev(name, rec, glob)
         if prev is not None and prev["state"] != state:
             self.app.set_status(
                 f"{rec['name']}: {STATE_LABELS[prev['state']]} -> {STATE_LABELS[state]} (overwritten)"
@@ -1054,8 +1090,8 @@ class RecordsTab(ttk.Frame):
         hist.pack(fill="x", pady=(6, 0))
         self.history_lbl = ttk.Label(hist, text="History: select a record", foreground="#666")
         self.history_lbl.pack(anchor="w")
-        self.history_bar = HistoryBar(hist, bg=self.app.cget("bg"))
-        self.history_bar.pack(fill="x", pady=(2, 0))
+        self.history_panel = HistoryPanel(hist, bg=self.app.cget("bg"))
+        self.history_panel.pack(fill="x")
 
         btns = ttk.Frame(self)
         btns.pack(fill="x", pady=(8, 0))
@@ -1109,19 +1145,18 @@ class RecordsTab(ttk.Frame):
         self.count_var.set(f"{len(rows)} shown / " + ", ".join(parts))
 
     def _show_history(self) -> None:
+        """Both timelines of the selected name, yours and the shared table's, whichever row was picked."""
         picked = self._selected()
         if len(picked) != 1:
             self.history_lbl.configure(text="History: select one record" if picked else "History: select a record")
-            self.history_bar.set([])
+            self.history_panel.set([], [])
             return
-        name, source = picked[0]
-        rows = self.app.db.history(name) if source == "local" else self.app.db.global_history(name)
-        self.history_bar.set(rows)
-        where = "" if source == "local" else " in the global table"
-        if not rows:
-            self.history_lbl.configure(text=f"History of {name}{where}: none")
-        else:
-            self.history_lbl.configure(text=f"History of {name}{where} ({len(rows)}): {history_summary(rows)}")
+        name = picked[0][0]
+        local, glob = self.app.db.find_both(name)
+        lrows = self.app.db.history(local["name"]) if local is not None else []
+        grows = self.app.db.global_history(glob["name"]) if glob is not None else []
+        self.history_panel.set(lrows, grows)
+        self.history_lbl.configure(text=f"History of {name}" + ("" if lrows or grows else ": none"))
 
     def _current_rows(self):
         q = self.search_var.get().strip()
@@ -1205,8 +1240,7 @@ class RecordsTab(ttk.Frame):
             messagebox.showerror("Rename record", str(exc), parent=self)
             return
         if result["action"] != "unchanged":
-            rec = self.app.db.get(new, loose=False)
-            self.app.record_saved(src["name"], rec["state"], rec["notes"], kind="rename", new_name=new)
+            self.app.record_saved(src["name"], src["state"], kind="rename", new_name=new)
         self.app.home.forget_undo(src["name"])
         self.refresh()
         if name_key(self.app.home.name_var.get()) == name_key(src["name"]):
@@ -1225,8 +1259,7 @@ class RecordsTab(ttk.Frame):
                 glob = self.app.db.get_global(name)
                 self.app.db.upsert(name, state, glob["notes"] if glob is not None else None)
                 adopted += 1
-            rec = self.app.db.get(name)
-            self.app.record_saved(name, state, rec["notes"] if rec is not None else "", kind="edit")
+            self.app.record_saved(name, state, kind="edit")
         self.refresh()
         if picked:
             extra = f" ({adopted} copied from the global table into your records)" if adopted else ""
@@ -1287,16 +1320,6 @@ class SettingsTab(ttk.Frame):
         if sync.table_url():
             box = ttk.LabelFrame(self.body, text="Global table", padding=10)
             box.pack(fill="x", pady=(10, 0))
-            row = ttk.Frame(box)
-            row.pack(fill="x")
-            ttk.Label(row, text="Preferred source for lookups:").pack(side="left")
-            self.prefer_var = tk.StringVar(value=self.app.db.lookup_preference())
-            prefer = ttk.Combobox(row, textvariable=self.prefer_var, values=("local", "global"),
-                                  state="readonly", width=8)
-            prefer.pack(side="left", padx=(6, 0))
-            prefer.bind("<<ComboboxSelected>>", lambda _e: self._set_preference())
-            ttk.Label(box, text="The other source is the fallback when the preferred one has no record for a name.",
-                      foreground="#666").pack(anchor="w", pady=(2, 8))
             row = ttk.Frame(box)
             row.pack(fill="x")
             self.global_var = tk.StringVar()
@@ -1481,14 +1504,6 @@ class SettingsTab(ttk.Frame):
             else:
                 self.upload_btn.configure(state="disabled")
 
-    def _set_preference(self) -> None:
-        pref = self.prefer_var.get()
-        self.app.db.set_setting("lookup_prefer", pref)
-        self.app.home.lookup(quiet=True)
-        first, second = (("your own records", "the global table") if pref == "local"
-                         else ("the global table", "your own records"))
-        self.app.set_status(f"Lookups now prefer {first}, falling back to {second}.")
-
     def refresh_global_label(self) -> None:
         if self.global_var is None:
             return
@@ -1545,9 +1560,11 @@ class MiniWindow(tk.Toplevel):
 
         self.state_lbl = tk.Label(self, text="", fg=MINI_DIM, bg=MINI_BG, font=("", 10, "bold"), anchor="w")
         self.state_lbl.pack(fill="x", padx=6)
+        self.src_lbl = tk.Label(self, text="", fg=MINI_DIM, bg=MINI_BG, font=("", 8), anchor="w")
         self.note_lbl = tk.Label(self, text="", fg=MINI_FG, bg=MINI_BG, font=("", 9), anchor="w",
                                  justify="left", wraplength=330)
-        self.history = HistoryBar(self, slots=MINI_HISTORY, caption_fg="#777777", bg=MINI_BG)
+        self.history = HistoryPanel(self, slots=MINI_HISTORY, caption_fg="#777777", who=("you", "everyone"),
+                                    font=("", 7), fg=MINI_DIM, bg=MINI_BG)
         self.history.pack(fill="x", padx=6, pady=(3, 0))
 
         btns = tk.Frame(self, bg=MINI_BG)
@@ -1563,7 +1580,9 @@ class MiniWindow(tk.Toplevel):
         foot = tk.Label(self, textvariable=app.home.auto_status, fg="#777777", bg=MINI_BG, font=("", 7), anchor="w")
         foot.pack(fill="x", padx=6, pady=(0, 3))
 
-        for w in (bar, self.name_lbl, self.state_lbl, self.note_lbl, self.history, btns, foot):  # not the buttons
+        drag = [bar, self.name_lbl, self.state_lbl, self.src_lbl, self.note_lbl, self.history, btns, foot]
+        drag += [w for pair in self.history.rows for w in pair]
+        for w in drag:  # everything but the buttons
             w.bind("<ButtonPress-1>", self._drag_start)
             w.bind("<B1-Motion>", self._drag_move)
             w.bind("<ButtonRelease-1>", self._drag_end)
@@ -1582,30 +1601,39 @@ class MiniWindow(tk.Toplevel):
         """Seconds in which clicks for the same name are ignored."""
         self.undo_btn.configure(text=f" undo {left:.0f}s " if left > 0 else " undo ")
 
-    def set_record(self, rec, name: str, source: str = "local", history: list = ()) -> None:
-        self.history.set(history)
-        note = rec["notes"] if (rec is not None and name) else ""
+    def set_record(self, name: str, local, glob, local_rows: list, global_rows: list) -> None:
+        """The Home panel compressed: headline from whichever source changed last, one line with
+        both states and counts, both notes, both timelines."""
+        if not name:
+            local = glob = None
+            local_rows, global_rows = [], []
+        self.history.set(local_rows, global_rows)
+        note = notes_text(local, glob, you="you", shared="all", both="note")
         if note:
             self.note_lbl.configure(text=note)
             self.note_lbl.pack(fill="x", padx=6, pady=(3, 0), after=self.history)
         else:
             self.note_lbl.pack_forget()
+        head = newest(local, glob)
         if not name:
             self.state_lbl.configure(text="waiting for a name...", fg=MINI_DIM)
-        elif rec is None:
+        elif head is None:
             self.state_lbl.configure(text="NEW  -  no record yet", fg=MINI_NEW_FG)
-        elif source == "global":
-            st = rec["state"]
-            self.state_lbl.configure(
-                text=f"{STATE_LABELS[st]}  -  global table  -  {rec['updated_at'][:10]}",
-                fg=MINI_STATE_FG[st],
-            )
         else:
-            st = rec["state"]
-            self.state_lbl.configure(
-                text=f"{STATE_LABELS[st]}  -  seen {rec['times_seen']}x  -  last {rec['updated_at'][:16]}",
-                fg=MINI_STATE_FG[st],
-            )
+            st = head["state"]
+            last = global_rows[-1]["ts"] if head is glob and global_rows else head["updated_at"]
+            self.state_lbl.configure(text=f"{STATE_LABELS[st]}  -  last {last[:16]}", fg=MINI_STATE_FG[st])
+        parts = []
+        if head is not None:
+            parts.append(f"you: {STATE_LABELS[local['state']]} {local['times_seen']}x" if local is not None else "you: -")
+            if sync.table_url():
+                parts.append(f"everyone: {STATE_LABELS[glob['state']]} {glob['times_seen']}x" if glob is not None
+                             else "everyone: -")
+        if parts:
+            self.src_lbl.configure(text="   |   ".join(parts))
+            self.src_lbl.pack(fill="x", padx=6, after=self.state_lbl)
+        else:
+            self.src_lbl.pack_forget()
 
     def _drag_start(self, e: tk.Event) -> None:
         self._dx, self._dy = e.x_root - self.winfo_x(), e.y_root - self.winfo_y()
