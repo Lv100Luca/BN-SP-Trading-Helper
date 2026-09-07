@@ -55,6 +55,73 @@ def _overlaps(win: tk.Misc, region: capture.Region, min_fraction: float = 0.10) 
     return ix * iy > min_fraction * w * h
 
 
+class HistoryBar(tk.Canvas):
+    """State timeline as a strip of colored blocks, oldest left, newest right. Hover a block for
+    its time. Blocks are equal-width; a run of the same state reads as one wide bar."""
+    HEIGHT = 16
+    MAX_BLOCKS = 60
+
+    def __init__(self, master: tk.Misc, **kw) -> None:
+        super().__init__(master, height=self.HEIGHT, highlightthickness=0, bd=0, **kw)
+        self._rows: list = []
+        self._tip: tk.Toplevel | None = None
+        self.bind("<Configure>", lambda _e: self._draw())
+        self.bind("<Motion>", self._hover)
+        self.bind("<Leave>", lambda _e: self._hide_tip())
+
+    def set(self, rows: list) -> None:
+        self._rows = list(rows)[-self.MAX_BLOCKS:]
+        self._draw()
+
+    def _draw(self) -> None:
+        self.delete("all")
+        n = len(self._rows)
+        w = self.winfo_width()
+        if not n or w < 10:
+            return
+        step = w / n
+        gap = 1 if step >= 4 else 0
+        for i, r in enumerate(self._rows):
+            x0 = round(i * step)
+            x1 = max(x0 + 1, round((i + 1) * step) - gap)
+            self.create_rectangle(x0, 1, x1, self.HEIGHT - 1, fill=STATE_COLORS[r["state"]], outline="")
+
+    def _hover(self, e: tk.Event) -> None:
+        n = len(self._rows)
+        w = self.winfo_width()
+        if not n or w < 10:
+            return
+        i = min(n - 1, max(0, int(e.x * n / w)))
+        r = self._rows[i]
+        kind = {"edit": " (edited)", "import": " (imported)"}.get(r["kind"], "")
+        self._show_tip(f"{STATE_LABELS[r['state']]}  {r['ts'][:16]}{kind}", e.x_root + 12, e.y_root + 12)
+
+    def _show_tip(self, text: str, x: int, y: int) -> None:
+        if self._tip is None:
+            self._tip = tk.Toplevel(self)
+            self._tip.wm_overrideredirect(True)
+            self._tip_lbl = tk.Label(self._tip, bg="#ffffe0", relief="solid", bd=1, padx=4, pady=1, font=("", 8))
+            self._tip_lbl.pack()
+        self._tip_lbl.configure(text=text)
+        self._tip.geometry(f"+{x}+{y}")
+
+    def _hide_tip(self) -> None:
+        if self._tip is not None:
+            self._tip.destroy()
+            self._tip = None
+
+
+def history_summary(rows: list) -> str:
+    """'afk x3 > fake x2 > afk > trading' for the runs in a timeline."""
+    runs: list[list] = []
+    for r in rows:
+        if runs and runs[-1][0] == r["state"]:
+            runs[-1][1] += 1
+        else:
+            runs.append([r["state"], 1])
+    return " > ".join(f"{st}{' x' + str(n) if n > 1 else ''}" for st, n in runs)
+
+
 def fix_dpi() -> None:
     """Make tkinter coordinates match physical pixels on Windows (needed for mss)."""
     if sys.platform != "win32":
@@ -347,6 +414,10 @@ class HomeTab(ttk.Frame):
         self.prev_title.pack(fill="x")
         self.prev_detail = tk.Label(self.prev_frame, text="", justify="left", anchor="w")
         self.prev_detail.pack(fill="x")
+        self.prev_history = HistoryBar(self.prev_frame)
+        self.prev_history.pack(fill="x", pady=(6, 0))
+        self.prev_history_lbl = tk.Label(self.prev_frame, text="", justify="left", anchor="w", font=("", 8))
+        self.prev_history_lbl.pack(fill="x")
 
         ttk.Label(self, text="Record current state (overwrites the previous one):").pack(anchor="w", pady=(8, 2))
         row = ttk.Frame(self)
@@ -600,6 +671,8 @@ class HomeTab(ttk.Frame):
         self.current_record = rec
         self.current_source = source if rec is not None else ""
         self.app.update_mini(rec, name, self.current_source)
+        own = rec if (rec is not None and source == "local") else other
+        self._show_history(own["name"] if own is not None else "")
         if not name:
             self._paint_prev("No name read yet", "", bg=None, fg="black")
         elif rec is None:
@@ -623,12 +696,23 @@ class HomeTab(ttk.Frame):
                 bg=STATE_PALE[st], fg=STATE_COLORS[st],
             )
 
+    def _show_history(self, name: str) -> None:
+        rows = self.app.db.history(name) if name else []
+        self.prev_history.set(rows)
+        if len(rows) > 1:
+            self.prev_history_lbl.configure(text=f"History ({len(rows)}): {history_summary(rows)}")
+        elif rows:
+            self.prev_history_lbl.configure(text="History: only this one sighting")
+        else:
+            self.prev_history_lbl.configure(text="")
+
     def _paint_prev(self, title: str, detail: str, bg: str | None, fg: str) -> None:
         bg = bg or self.app.cget("bg")
-        for w in (self.prev_frame, self.prev_title, self.prev_detail):
+        for w in (self.prev_frame, self.prev_title, self.prev_detail, self.prev_history, self.prev_history_lbl):
             w.configure(bg=bg)
         self.prev_title.configure(text=title, fg=fg)
         self.prev_detail.configure(text=detail, fg=fg)
+        self.prev_history_lbl.configure(fg=fg)
 
     def save_state(self, state: str) -> None:
         name = self.name_var.get().strip()
@@ -701,6 +785,14 @@ class RecordsTab(ttk.Frame):
         sb.pack(side="right", fill="y")
         self.tree.bind("<Double-1>", self.load_selected)
         self.tree.bind("<Delete>", self.delete_selected)
+        self.tree.bind("<<TreeviewSelect>>", lambda _e: self._show_history())
+
+        hist = ttk.Frame(self)
+        hist.pack(fill="x", pady=(6, 0))
+        self.history_lbl = ttk.Label(hist, text="History: select a record", foreground="#666")
+        self.history_lbl.pack(anchor="w")
+        self.history_bar = HistoryBar(hist, bg=self.app.cget("bg"))
+        self.history_bar.pack(fill="x", pady=(2, 0))
 
         btns = ttk.Frame(self)
         btns.pack(fill="x", pady=(8, 0))
@@ -741,6 +833,7 @@ class RecordsTab(ttk.Frame):
         keep = [i for i in (self._iid(r["source"], r["name"]) for r in rows) if i in selected]
         if keep:
             self.tree.selection_set(keep)
+        self._show_history()
         source = self.source_var.get()
         parts = []
         if source in ("both", "local"):
@@ -750,6 +843,21 @@ class RecordsTab(ttk.Frame):
         if source in ("both", "global"):
             parts.append(f"{sum(self.app.db.counts('global').values())} global")
         self.count_var.set(f"{len(rows)} shown / " + ", ".join(parts))
+
+    def _show_history(self) -> None:
+        picked = self._selected()
+        if len(picked) != 1:
+            self.history_lbl.configure(text="History: select one record" if picked else "History: select a record")
+            self.history_bar.set([])
+            return
+        name, source = picked[0]
+        rows = self.app.db.history(name)
+        self.history_bar.set(rows)
+        if not rows:
+            why = " (global table entries have no history)" if source == "global" else ""
+            self.history_lbl.configure(text=f"History of {name}: none{why}")
+        else:
+            self.history_lbl.configure(text=f"History of {name} ({len(rows)}): {history_summary(rows)}")
 
     def _current_rows(self):
         q = self.search_var.get().strip()

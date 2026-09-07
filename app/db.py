@@ -89,6 +89,14 @@ CREATE TABLE IF NOT EXISTS global_records (   -- read-only copy of the shared ta
     updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_global_key ON global_records(name_key);
+CREATE TABLE IF NOT EXISTS sightings (        -- state timeline per record, oldest first by ts
+    id        INTEGER PRIMARY KEY,
+    record_id INTEGER NOT NULL,
+    state     TEXT NOT NULL,
+    ts        TEXT NOT NULL,
+    kind      TEXT NOT NULL DEFAULT 'seen'    -- 'seen' (saved on Home), 'edit' (Records tab), 'import'
+);
+CREATE INDEX IF NOT EXISTS idx_sightings_record ON sightings(record_id, ts);
 """
 
 
@@ -118,6 +126,7 @@ class Database:
         self._migrate()
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_records_key ON records(name_key)")
         self._backfill_keys()
+        self._backfill_sightings()
         self.migration_report: dict | None = None
         if absorb_legacy:
             self._absorb_legacy(LEGACY_DB_PATH)
@@ -185,6 +194,15 @@ class Database:
         if rows:
             self.conn.commit()
 
+    def _backfill_sightings(self) -> None:
+        """Records from before the timeline existed get one entry: their current state at updated_at."""
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO sightings (record_id, state, ts, kind)"
+                " SELECT id, state, updated_at, 'seen' FROM records"
+                "  WHERE id NOT IN (SELECT record_id FROM sightings)"
+            )
+
     def close(self) -> None:
         self.conn.close()
 
@@ -240,26 +258,48 @@ class Database:
                 """,
                 (state, notes, now, existing["id"]),
             )
+            self._add_sighting(existing["id"], state, now)
             self.conn.commit()
             return self.get(existing["name"], loose=False)
-        self.conn.execute(
+        cur = self.conn.execute(
             """
             INSERT INTO records (name, state, notes, times_seen, created_at, updated_at, name_key)
             VALUES (?, ?, ?, 1, ?, ?, ?)
             """,
             (name, state, notes or "", now, now, name_key(name)),
         )
+        self._add_sighting(cur.lastrowid, state, now)
         self.conn.commit()
         return self.get(name, loose=False)
+
+    def _add_sighting(self, record_id: int, state: str, ts: str, kind: str = "seen") -> None:
+        self.conn.execute(
+            "INSERT INTO sightings (record_id, state, ts, kind) VALUES (?, ?, ?, ?)", (record_id, state, ts, kind)
+        )
+
+    def history(self, name: str, limit: int = 200) -> list[sqlite3.Row]:
+        """State timeline of your own record for `name`, oldest first (at most the `limit` newest)."""
+        rec = self.get(name)
+        if rec is None:
+            return []
+        rows = self.conn.execute(
+            "SELECT state, ts, kind FROM sightings WHERE record_id = ? ORDER BY ts DESC, id DESC LIMIT ?",
+            (rec["id"], limit),
+        ).fetchall()
+        rows.reverse()
+        return rows
 
     def set_state(self, name: str, state: str) -> None:
         """Change the state of an existing record without counting an encounter."""
         if state not in STATES:
             raise ValueError(f"unknown state {state!r}")
-        self.conn.execute(
-            "UPDATE records SET state = ?, updated_at = ? WHERE name = ? COLLATE NOCASE",
-            (state, _now(), normalize_name(name)),
-        )
+        rec = self.get(name, loose=False)
+        if rec is None:
+            return
+        now = _now()
+        self.conn.execute("UPDATE records SET state = ?, updated_at = ? WHERE id = ?", (state, now, rec["id"]))
+        if rec["state"] != state:
+            self._add_sighting(rec["id"], state, now, "edit")
         self.conn.commit()
 
     # Every row carries a `source` column. Global rows have no encounter count (times_seen = 0)
@@ -289,9 +329,11 @@ class Database:
         return self.conn.execute(sql, params).fetchall()
 
     def delete(self, name: str) -> None:
-        self.conn.execute(
-            "DELETE FROM records WHERE name = ? COLLATE NOCASE", (normalize_name(name),)
-        )
+        rec = self.get(name, loose=False)
+        if rec is None:
+            return
+        self.conn.execute("DELETE FROM sightings WHERE record_id = ?", (rec["id"],))
+        self.conn.execute("DELETE FROM records WHERE id = ?", (rec["id"],))
         self.conn.commit()
 
     def merge_records(self, records: Iterable[dict]) -> dict[str, int]:
@@ -313,11 +355,12 @@ class Database:
             notes = str(rec.get("notes") or "")
             existing = self.get(name)
             if existing is None:
-                self.conn.execute(
+                cur = self.conn.execute(
                     "INSERT INTO records (name, state, notes, times_seen, created_at, updated_at, name_key)"
                     " VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (name, state, notes, seen, first, last, name_key(name)),
                 )
+                self._add_sighting(cur.lastrowid, state, last, "import")
                 added += 1
                 continue
             merged = (
@@ -335,6 +378,8 @@ class Database:
                 "UPDATE records SET state = ?, notes = ?, times_seen = ?, created_at = ?, updated_at = ? WHERE id = ?",
                 (*merged, existing["id"]),
             )
+            if merged[0] != existing["state"]:
+                self._add_sighting(existing["id"], merged[0], last, "import")
             updated += 1
         self.conn.commit()
         return {"added": added, "updated": updated, "unchanged": unchanged, "skipped": skipped}
@@ -368,6 +413,7 @@ class Database:
             if len(notes) == 2 and notes[0] == notes[1]:
                 notes = notes[:1]
             self.conn.execute("DELETE FROM records WHERE id = ?", (src["id"],))
+            self.conn.execute("UPDATE sightings SET record_id = ? WHERE record_id = ?", (dst["id"], src["id"]))
             self.conn.execute(
                 "UPDATE records SET name = ?, name_key = ?, state = ?, notes = ?, times_seen = ?,"
                 " created_at = ?, updated_at = ? WHERE id = ?",
