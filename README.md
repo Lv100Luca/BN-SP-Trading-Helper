@@ -39,7 +39,8 @@ Python 3.10+ with tkinter (bundled on Windows/macOS; on Linux `sudo apt install 
    underneath. Hover a block for its time. Or "no previous record".
 4. Fix the name in the text box if OCR got it slightly wrong (auto-read pauses while you type), then click
    **TRADING / FIGHTING / AFK / FAKE**. The state becomes the current one and is added to the history.
-   Misclicked? **Undo last save** takes the encounter back again (also on the mini HUD).
+   Misclicked? **Undo last save** takes the encounter back again (also on the mini HUD). Further clicks
+   for the same name are ignored for 15 s (a countdown shows), so a double click cannot count twice.
 5. **Records** tab: search, filter by state, double-click to load a name into Home, change the state
    (a correction, not an encounter), **Rename...** a record whose name OCR got wrong (merges into the
    right record if one exists) or delete it. **Export...** saves your own records as JSON (or CSV for

@@ -24,7 +24,7 @@ STATE_FG = {"trading": "white", "fighting": "white", "afk": "white", "fake": "#2
 STATE_PALE = {"trading": "#e8f5e9", "fighting": "#ffebee", "afk": "#eeeeee", "fake": "#fff8e1"}
 GLOBAL_PALE = "#e3f2fd"   # previous-record panel when the state comes from the shared table
 PREVIEW_MAX = (520, 140)
-READING_PREVIEW_MAX = (620, 160)
+SAVE_COOLDOWN = 15.0   # seconds: clicks for the same name are ignored (double click guard); Undo still works
 
 
 def _fingerprint(img: Image.Image) -> np.ndarray:
@@ -542,8 +542,12 @@ class HomeTab(ttk.Frame):
                 activebackground=STATE_COLORS[st], activeforeground=STATE_FG[st],
                 command=lambda s=st: self.save_state(s),
             ).pack(side="left", fill="x", expand=True, padx=3)
-        self.undo_btn = ttk.Button(self, text="Undo last save", command=self.undo_save, state="disabled")
-        self.undo_btn.pack(anchor="e", pady=(6, 0))
+        row = ttk.Frame(self)
+        row.pack(fill="x", pady=(6, 0))
+        self.cooldown_var = tk.StringVar()
+        ttk.Label(row, textvariable=self.cooldown_var, foreground="#666").pack(side="left")
+        self.undo_btn = ttk.Button(row, text="Undo last save", command=self.undo_save, state="disabled")
+        self.undo_btn.pack(side="right")
 
     # ------------------------------------------------------------------ region
     def _refresh_region_label(self) -> None:
@@ -827,14 +831,21 @@ class HomeTab(ttk.Frame):
         if not name:
             messagebox.showinfo("No name", "Read or type a name first.")
             return
+        ls = self._last_save
+        if ls is not None and name_key(ls["name"]) == name_key(name) and self._cooldown_left() > 0:
+            self.app.set_status(f"{ls['name']} was saved as {STATE_LABELS[ls['state']]} {SAVE_COOLDOWN - self._cooldown_left():.0f} s ago; "
+                                f"a new encounter counts in {self._cooldown_left():.0f} s. Misclick? Undo it.")
+            return
         prev = self.app.db.get(name)
         rec = self.app.db.upsert(name, state)
         upload_id, ts = self.app.record_saved(rec["name"], state, rec["notes"])
         self._last_save = {
             "name": rec["name"], "state": state, "prev": dict(prev) if prev is not None else None,
             "sighting_id": self.app.db.last_sighting_id(rec["id"]), "upload_id": upload_id, "ts": ts,
+            "at": time.monotonic(),
         }
         self._refresh_undo()
+        self._tick_cooldown()
         self._show_prev(rec, name, "local", other=self.app.db.get_global(name))
         if prev is not None and prev["state"] != state:
             self.app.set_status(
@@ -842,6 +853,24 @@ class HomeTab(ttk.Frame):
             )
         else:
             self.app.set_status(f"{rec['name']}: saved as {STATE_LABELS[state]}")
+
+    def _cooldown_left(self) -> float:
+        ls = self._last_save
+        return max(0.0, SAVE_COOLDOWN - (time.monotonic() - ls["at"])) if ls else 0.0
+
+    def _tick_cooldown(self) -> None:
+        left = self._cooldown_left()
+        if left <= 0:
+            self.cooldown_var.set("")
+            if self.app.mini is not None:
+                self.app.mini.set_cooldown(0)
+            return
+        ls = self._last_save
+        self.cooldown_var.set(f"{ls['name']} saved as {STATE_LABELS[ls['state']]}. Clicks for this name are "
+                              f"ignored for {left:.0f} s (double click guard); misclick = Undo.")
+        if self.app.mini is not None:
+            self.app.mini.set_cooldown(left)
+        self.after(250, self._tick_cooldown)
 
     def undo_save(self) -> None:
         """Take back the last state saved here or on the mini HUD: the sighting and encounter count
@@ -854,6 +883,7 @@ class HomeTab(ttk.Frame):
         if ls["upload_id"] is not None:
             self.app.retract_upload(ls["upload_id"], ls["name"], ls["state"], ls["ts"])
         self._refresh_undo()
+        self._tick_cooldown()
         self.lookup(quiet=True)
         back = f"back to {STATE_LABELS[ls['prev']['state']]}" if ls["prev"] else "record removed"
         self.app.set_status(f"Undone: {ls['name']} {STATE_LABELS[ls['state']]} ({back}).")
@@ -1367,7 +1397,7 @@ class MiniWindow(tk.Toplevel):
         small = dict(bg=MINI_BG, fg=MINI_DIM, bd=0, activebackground="#3a3a3a", activeforeground="white")
         tk.Button(bar, text=" X ", command=app._on_close, **small).pack(side="right")
         tk.Button(bar, text=" [ ] ", command=app.exit_mini, **small).pack(side="right")
-        self.undo_btn = tk.Button(bar, text=" undo ", command=app.home.undo_save,
+        self.undo_btn = tk.Button(bar, text=" undo ", command=app.home.undo_save, width=8,
                                   disabledforeground="#4a4a4a", **small)
         self.undo_btn.pack(side="right")
 
@@ -1399,9 +1429,14 @@ class MiniWindow(tk.Toplevel):
         self.update_idletasks()
         self.lift()
         self.set_undo(app.home._last_save is not None)
+        self.set_cooldown(app.home._cooldown_left())
 
     def set_undo(self, on: bool) -> None:
         self.undo_btn.configure(state="normal" if on else "disabled")
+
+    def set_cooldown(self, left: float) -> None:
+        """Seconds in which clicks for the same name are ignored."""
+        self.undo_btn.configure(text=f" undo {left:.0f}s " if left > 0 else " undo ")
 
     def set_record(self, rec, name: str, source: str = "local", history: list = ()) -> None:
         self.history.set(history)
