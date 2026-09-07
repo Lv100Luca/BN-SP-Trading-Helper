@@ -112,14 +112,13 @@ class HistoryBar(tk.Canvas):
 
 
 def history_summary(rows: list) -> str:
-    """'afk x3 > fake x2 > afk > trading' for the runs in a timeline."""
-    runs: list[list] = []
+    """Share of each state in a timeline, most common first: 'trading 59%  |  fake 23%  |  afk 18%'."""
+    counts: dict[str, int] = {}
     for r in rows:
-        if runs and runs[-1][0] == r["state"]:
-            runs[-1][1] += 1
-        else:
-            runs.append([r["state"], 1])
-    return " > ".join(f"{st}{' x' + str(n) if n > 1 else ''}" for st, n in runs)
+        counts[r["state"]] = counts.get(r["state"], 0) + 1
+    total = sum(counts.values()) or 1
+    ranked = sorted(counts.items(), key=lambda kv: (-kv[1], STATES.index(kv[0])))
+    return "  |  ".join(f"{st} {round(100 * n / total)}%" for st, n in ranked)
 
 
 def fix_dpi() -> None:
