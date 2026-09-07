@@ -25,7 +25,7 @@ STATE_FG = {"trading": "white", "fighting": "white", "afk": "white", "fake": "#2
 STATE_PALE = {"trading": "#e8f5e9", "fighting": "#ffebee", "afk": "#eeeeee", "fake": "#fff8e1"}
 GLOBAL_PALE = "#e3f2fd"   # previous-record panel when the state comes from the shared table
 PREVIEW_MAX = (520, 140)
-DEFAULT_SIZE = (760, 660)   # first start; afterwards the last window size is restored
+MIN_SIZE = (640, 520)   # smallest window; also the size on first start (the last size is restored later)
 SAVE_COOLDOWN = 15   # seconds the double click guard ignores clicks for the same name (packaged app)
 
 
@@ -164,7 +164,7 @@ class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(f"Trade Check v{__version__}")
-        self.minsize(640, 520)
+        self.minsize(*MIN_SIZE)
         try:
             self.tk.call("tk", "scaling", self.winfo_fpixels("1i") / 72.0)
         except tk.TclError:
@@ -212,12 +212,12 @@ class App(tk.Tk):
             self.after(30_000, self._sync_tick)
 
     def _restore_geometry(self) -> None:
-        """Last window size and position, or the default size (the content wraps to fit)."""
+        """Last window size and position, or the minimum size (the content wraps to fit)."""
         saved = self.db.get_setting("win_geometry") or ""
         if re.fullmatch(r"\d+x\d+([+-]\d+[+-]\d+)?", saved):
             self.geometry(saved)
             return
-        self.geometry("%dx%d" % DEFAULT_SIZE)
+        self.geometry("%dx%d" % MIN_SIZE)
 
     def _build_footer(self) -> None:
         """Last action on the left, version on the right. Everything else lives in the Settings tab."""
