@@ -43,11 +43,13 @@ Python 3.10+ with tkinter (bundled on Windows/macOS; on Linux `sudo apt install 
    for the same name are ignored for 15 s (a countdown shows), so a double click cannot count twice.
 5. **Records** tab: search, filter by state, double-click to load a name into Home, change the state
    (a correction, not an encounter), **Rename...** a record whose name OCR got wrong (merges into the
-   right record if one exists) or delete it. **Export...** saves your own records as JSON (or CSV for
+   right record if one exists), **Notes...** for a free-text note (also on Home; shown in the panel) or
+   delete it. **Export...** saves your own records as JSON (or CSV for
    Excel); with a search or filter active only the matching rows are exported.
 6. **Mini mode** (button in the top row): shrinks the app to a small always-on-top overlay with just the
    name, its previous state, the last ten encounters and the four state buttons, so it can sit in front of
-   the game. Drag the text to move it (position is remembered), `undo` takes the last save back, `[ ]`
+   the game. The name is editable there too (Enter looks it up). Drag the state line to move it
+   (position is remembered), `undo` takes the last save back, `[ ]`
    returns to the full window, `X` quits. Auto-read keeps running. The app reopens in whichever mode you
    used last. Works with borderless/windowed games; exclusive fullscreen hides every overlay.
 
@@ -86,7 +88,8 @@ key** (the app checks it with the server first and only keeps a working one), ti
 Every save, correction, undo and rename is queued and pushed on the sync interval, on **Upload now** and
 when the app closes. On the server each save is one sighting in that name's history; Undo takes your own
 sighting back again, Rename moves your sightings to the right name. You can only ever change what you
-uploaded yourself. A revoked key switches uploads off with a red note in Settings.
+uploaded yourself. A revoked key switches uploads off with a red note in Settings; **Discard queued**
+throws away changes that have not been pushed yet.
 
 The admin can also replace the whole table with an export: `tools/publish_global.py <server url>
 records.json`. The feature is off until `GLOBAL_TABLE_URL` in `app/__init__.py` is set (or the

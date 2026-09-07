@@ -340,6 +340,13 @@ class Database:
             )
         self.conn.commit()
 
+    def set_notes(self, name: str, notes: str) -> None:
+        """Notes are not an encounter: no sighting, updated_at untouched."""
+        rec = self.get(name, loose=False)
+        if rec is not None:
+            self.conn.execute("UPDATE records SET notes = ? WHERE id = ?", (" ".join((notes or "").split()), rec["id"]))
+            self.conn.commit()
+
     def set_state(self, name: str, state: str) -> None:
         """Change the state of an existing record without counting an encounter."""
         if state not in STATES:
@@ -564,6 +571,11 @@ class Database:
         cur = self.conn.execute("DELETE FROM pending_uploads WHERE id = ?", (upload_id,))
         self.conn.commit()
         return cur.rowcount > 0
+
+    def clear_all_uploads(self) -> int:
+        cur = self.conn.execute("DELETE FROM pending_uploads")
+        self.conn.commit()
+        return cur.rowcount
 
     def pending_uploads(self) -> list[sqlite3.Row]:
         return self.conn.execute("SELECT * FROM pending_uploads ORDER BY id").fetchall()

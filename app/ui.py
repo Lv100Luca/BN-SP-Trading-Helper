@@ -308,6 +308,27 @@ class App(tk.Tk):
             self.db.queue_upload(name, state, "", "retract", ts=ts)
         self.settings.refresh_pending_label()
 
+    def edit_notes(self, name: str, parent: tk.Misc) -> bool:
+        """Dialog for the notes of your own record `name`. Contributors' notes go to the global table
+        as an edit (the server keeps the newest non-empty note). True when something changed."""
+        rec = self.db.get(name)
+        if rec is None:
+            messagebox.showinfo("Notes", f"'{name}' has no record of yours yet. Save a state first.", parent=parent)
+            return False
+        glob = self.db.get_global(rec["name"])
+        hint = (f"\nGlobal table says: {glob['notes']}" if glob is not None and glob["notes"]
+                and glob["notes"] != rec["notes"] else "")
+        new = simpledialog.askstring("Notes", f"Notes for {rec['name']}:{hint}", initialvalue=rec["notes"], parent=parent)
+        if new is None:
+            return False
+        new = " ".join(new.split())
+        if new == rec["notes"]:
+            return False
+        self.db.set_notes(rec["name"], new)
+        self.record_saved(rec["name"], rec["state"], new, kind="edit")
+        self.set_status(f"{rec['name']}: notes {'saved' if new else 'removed'}.")
+        return True
+
     def run_bg(self, work, done) -> None:
         """Run `work()` in a thread and hand (result, exception) to `done` on the UI thread."""
         box: queue.Queue = queue.Queue()
@@ -517,7 +538,7 @@ class HomeTab(ttk.Frame):
         entry = ttk.Entry(row, textvariable=self.name_var, font=("", 12))
         entry.pack(side="left", fill="x", expand=True, padx=6)
         entry.bind("<Return>", lambda _e: self.lookup())
-        entry.bind("<Key>", lambda _e: setattr(self, "_typing_until", time.time() + 3.0))
+        entry.bind("<Key>", lambda _e: self.note_typing())
         self.name_entry = entry
         ttk.Button(row, text="Lookup", command=self.lookup).pack(side="left")
 
@@ -548,6 +569,19 @@ class HomeTab(ttk.Frame):
         ttk.Label(row, textvariable=self.cooldown_var, foreground="#666").pack(side="left")
         self.undo_btn = ttk.Button(row, text="Undo last save", command=self.undo_save, state="disabled")
         self.undo_btn.pack(side="right")
+        ttk.Button(row, text="Notes...", command=self.edit_notes).pack(side="right", padx=(0, 6))
+
+    def note_typing(self) -> None:
+        """Auto-read leaves the name box alone for a moment while a human types in it."""
+        self._typing_until = time.time() + 3.0
+
+    def edit_notes(self) -> None:
+        name = self.name_var.get().strip()
+        if not name:
+            messagebox.showinfo("Notes", "Read or type a name first.")
+            return
+        if self.app.edit_notes(name, self):
+            self.lookup(quiet=True)
 
     # ------------------------------------------------------------------ region
     def _refresh_region_label(self) -> None:
@@ -793,9 +827,10 @@ class HomeTab(ttk.Frame):
         else:
             st = rec["state"]
             hint = f"   |   global table: {STATE_LABELS[other['state']]}" if other is not None else ""
+            notes = f"\n{rec['notes']}" if rec["notes"] else ""
             self._paint_prev(
                 f"{rec['name']}: previously {STATE_LABELS[st]}",
-                f"Seen {rec['times_seen']}x   |   first {rec['created_at']}   |   last {rec['updated_at']}{hint}",
+                f"Seen {rec['times_seen']}x   |   first {rec['created_at']}   |   last {rec['updated_at']}{hint}{notes}",
                 bg=STATE_PALE[st], fg=STATE_COLORS[st],
             )
 
@@ -968,6 +1003,7 @@ class RecordsTab(ttk.Frame):
         btns.pack(fill="x", pady=(8, 0))
         ttk.Button(btns, text="Load into Home", command=self.load_selected).pack(side="left")
         ttk.Button(btns, text="Rename...", command=self.rename_selected).pack(side="left", padx=(6, 0))
+        ttk.Button(btns, text="Notes...", command=self.notes_selected).pack(side="left", padx=(6, 0))
         ttk.Label(btns, text="Set:").pack(side="left", padx=(10, 0))
         for st in STATES:
             tk.Button(
@@ -1072,6 +1108,15 @@ class RecordsTab(ttk.Frame):
             return
         self.app.home.set_name(names[0])
         self.app.nb.select(0)
+
+    def notes_selected(self) -> None:
+        picked = self._selected()
+        if len(picked) != 1:
+            messagebox.showinfo("Notes", "Select exactly one record.", parent=self)
+            return
+        if self.app.edit_notes(picked[0][0], self):
+            self.refresh()
+            self.app.home.lookup(quiet=True)
 
     def rename_selected(self) -> None:
         """Fix a name OCR got wrong. If the new name already has a record the two are merged after
@@ -1240,6 +1285,8 @@ class SettingsTab(ttk.Frame):
         self.pending_lbl.pack(side="left", padx=(16, 0))
         self.upload_btn = ttk.Button(row, text="Upload now", command=self.app.push_uploads)
         self.upload_btn.pack(side="right")
+        self.discard_btn = ttk.Button(row, text="Discard queued", command=self._discard_queue)
+        self.discard_btn.pack(side="right", padx=(0, 6))
         self._rejected = False   # the server answered 401 to an upload this session
         self.refresh_pending_label()
 
@@ -1294,6 +1341,19 @@ class SettingsTab(ttk.Frame):
 
         self.app.run_bg(lambda: sync.check_key(url, key), done)
 
+    def _discard_queue(self) -> None:
+        n = self.app.db.pending_upload_count()
+        if not n:
+            return
+        if not messagebox.askyesno("Discard queued uploads",
+                                   f"Throw away {n} queued change(s)? They will never reach the global table "
+                                   "(undo and rename fixes included). Your own records are not affected.",
+                                   parent=self):
+            return
+        self.app.db.clear_all_uploads()
+        self.refresh_pending_label()
+        self.app.set_status(f"Discarded {n} queued upload(s).")
+
     def key_rejected(self) -> None:
         """An upload came back 401: the key was revoked. Stop sharing until a working key is saved."""
         self.app.db.set_setting("share_uploads", "0")
@@ -1331,6 +1391,7 @@ class SettingsTab(ttk.Frame):
         self.pending_lbl.configure(foreground=color)
         self.share_chk.configure(state="normal" if key else "disabled")
         self.upload_btn.configure(state="normal" if (n and self.app.sharing()) else "disabled")
+        self.discard_btn.configure(state="normal" if n else "disabled")
 
     def set_upload_enabled(self, on: bool) -> None:
         if hasattr(self, "upload_btn"):
@@ -1391,9 +1452,13 @@ class MiniWindow(tk.Toplevel):
 
         bar = tk.Frame(self, bg=MINI_BG)
         bar.pack(fill="x", padx=6, pady=(4, 0))
-        self.name_lbl = tk.Label(bar, textvariable=app.home.name_var, fg=MINI_FG, bg=MINI_BG,
-                                 font=("", 12, "bold"), anchor="w")
-        self.name_lbl.pack(side="left", fill="x", expand=True)
+        # Editable: fix a misread right on the HUD, Enter looks the name up. Typing pauses auto-read.
+        self.name_entry = tk.Entry(bar, textvariable=app.home.name_var, fg=MINI_FG, bg=MINI_BG,
+                                   insertbackground=MINI_FG, font=("", 12, "bold"), bd=0,
+                                   highlightthickness=0, relief="flat")
+        self.name_entry.pack(side="left", fill="x", expand=True)
+        self.name_entry.bind("<Return>", lambda _e: app.home.lookup())
+        self.name_entry.bind("<Key>", lambda _e: app.home.note_typing())
         small = dict(bg=MINI_BG, fg=MINI_DIM, bd=0, activebackground="#3a3a3a", activeforeground="white")
         tk.Button(bar, text=" X ", command=app._on_close, **small).pack(side="right")
         tk.Button(bar, text=" [ ] ", command=app.exit_mini, **small).pack(side="right")
@@ -1419,7 +1484,7 @@ class MiniWindow(tk.Toplevel):
         foot = tk.Label(self, textvariable=app.home.auto_status, fg="#777777", bg=MINI_BG, font=("", 7), anchor="w")
         foot.pack(fill="x", padx=6, pady=(0, 3))
 
-        for w in (bar, self.name_lbl, self.state_lbl, self.history, btns, foot):  # not the buttons themselves
+        for w in (bar, self.state_lbl, self.history, btns, foot):  # not the buttons or the name box
             w.bind("<ButtonPress-1>", self._drag_start)
             w.bind("<B1-Motion>", self._drag_move)
             w.bind("<ButtonRelease-1>", self._drag_end)
