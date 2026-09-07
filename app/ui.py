@@ -544,14 +544,18 @@ class HomeTab(ttk.Frame):
 
         self.prev_frame = tk.Frame(self, bd=2, relief="ridge", padx=10, pady=10)
         self.prev_frame.pack(fill="x", pady=6)
-        self.prev_title = tk.Label(self.prev_frame, text="No name read yet", font=("", 13, "bold"), anchor="w")
-        self.prev_title.pack(fill="x")
+        self.prev_top = tk.Frame(self.prev_frame)
+        self.prev_top.pack(fill="x")
+        self.prev_title = tk.Label(self.prev_top, text="No name read yet", font=("", 13, "bold"), anchor="w")
+        self.prev_title.pack(side="left", fill="x", expand=True)
+        self.prev_history_lbl = tk.Label(self.prev_top, text="", anchor="e", font=("", 8))
+        self.prev_history_lbl.pack(side="right", anchor="s")
         self.prev_detail = tk.Label(self.prev_frame, text="", justify="left", anchor="w")
         self.prev_detail.pack(fill="x")
         self.prev_history = HistoryBar(self.prev_frame)
         self.prev_history.pack(fill="x", pady=(6, 0))
-        self.prev_history_lbl = tk.Label(self.prev_frame, text="", justify="left", anchor="w", font=("", 8))
-        self.prev_history_lbl.pack(fill="x")
+        self.prev_notes = tk.Label(self.prev_frame, text="", justify="left", anchor="w", wraplength=600)
+        self.prev_notes.pack(fill="x")
 
         ttk.Label(self, text="Record the current state (added to this player's history):").pack(anchor="w", pady=(8, 2))
         row = ttk.Frame(self)
@@ -818,22 +822,20 @@ class HomeTab(ttk.Frame):
             self._paint_prev(f"{name}: no previous record", "First time seeing this player.", bg="#fff8e1", fg="#795548")
         elif source == "global":
             st = rec["state"]
-            notes = f"   |   {rec['notes']}" if rec["notes"] else ""
             own = (f"Your own record: {STATE_LABELS[other['state']]} (seen {other['times_seen']}x)"
                    if other is not None else "Not in your own records")
             self._paint_prev(
                 f"{rec['name']}: {STATE_LABELS[st]} in the global table",
-                f"{own}   |   table entry from {rec['updated_at'][:10]}{notes}",
-                bg=GLOBAL_PALE, fg=STATE_COLORS[st],
+                f"{own}   |   table entry from {rec['updated_at'][:10]}",
+                bg=GLOBAL_PALE, fg=STATE_COLORS[st], notes=rec["notes"],
             )
         else:
             st = rec["state"]
             hint = f"   |   global table: {STATE_LABELS[other['state']]}" if other is not None else ""
-            notes = f"\n{rec['notes']}" if rec["notes"] else ""
             self._paint_prev(
                 f"{rec['name']}: previously {STATE_LABELS[st]}",
-                f"Seen {rec['times_seen']}x   |   first {rec['created_at']}   |   last {rec['updated_at']}{hint}{notes}",
-                bg=STATE_PALE[st], fg=STATE_COLORS[st],
+                f"Seen {rec['times_seen']}x   |   first {rec['created_at']}   |   last {rec['updated_at']}{hint}",
+                bg=STATE_PALE[st], fg=STATE_COLORS[st], notes=rec["notes"],
             )
 
     def _show_history(self, rec, source: str, other=None) -> list:
@@ -855,13 +857,15 @@ class HomeTab(ttk.Frame):
             self.prev_history_lbl.configure(text="")
         return rows
 
-    def _paint_prev(self, title: str, detail: str, bg: str | None, fg: str) -> None:
+    def _paint_prev(self, title: str, detail: str, bg: str | None, fg: str, notes: str = "") -> None:
         bg = bg or self.app.cget("bg")
-        for w in (self.prev_frame, self.prev_title, self.prev_detail, self.prev_history, self.prev_history_lbl):
+        for w in (self.prev_frame, self.prev_top, self.prev_title, self.prev_detail, self.prev_history,
+                  self.prev_history_lbl, self.prev_notes):
             w.configure(bg=bg)
         self.prev_title.configure(text=title, fg=fg)
         self.prev_detail.configure(text=detail, fg=fg)
         self.prev_history_lbl.configure(fg=fg)
+        self.prev_notes.configure(text=notes or "", fg=fg)
 
     def save_state(self, state: str) -> None:
         name = self.name_var.get().strip()
@@ -1468,6 +1472,8 @@ class MiniWindow(tk.Toplevel):
 
         self.state_lbl = tk.Label(self, text="", fg=MINI_DIM, bg=MINI_BG, font=("", 10, "bold"), anchor="w")
         self.state_lbl.pack(fill="x", padx=6)
+        self.note_lbl = tk.Label(self, text="", fg=MINI_FG, bg=MINI_BG, font=("", 9), anchor="w",
+                                 justify="left", wraplength=330)
         self.history = HistoryBar(self, slots=MINI_HISTORY, caption_fg="#777777", bg=MINI_BG)
         self.history.pack(fill="x", padx=6, pady=(3, 0))
 
@@ -1484,7 +1490,7 @@ class MiniWindow(tk.Toplevel):
         foot = tk.Label(self, textvariable=app.home.auto_status, fg="#777777", bg=MINI_BG, font=("", 7), anchor="w")
         foot.pack(fill="x", padx=6, pady=(0, 3))
 
-        for w in (bar, self.state_lbl, self.history, btns, foot):  # not the buttons or the name box
+        for w in (bar, self.state_lbl, self.note_lbl, self.history, btns, foot):  # not the buttons or the name box
             w.bind("<ButtonPress-1>", self._drag_start)
             w.bind("<B1-Motion>", self._drag_move)
             w.bind("<ButtonRelease-1>", self._drag_end)
@@ -1505,6 +1511,12 @@ class MiniWindow(tk.Toplevel):
 
     def set_record(self, rec, name: str, source: str = "local", history: list = ()) -> None:
         self.history.set(history)
+        note = rec["notes"] if (rec is not None and name) else ""
+        if note:
+            self.note_lbl.configure(text=note)
+            self.note_lbl.pack(fill="x", padx=6, after=self.state_lbl)
+        else:
+            self.note_lbl.pack_forget()
         if not name:
             self.state_lbl.configure(text="waiting for a name...", fg=MINI_DIM)
         elif rec is None:
