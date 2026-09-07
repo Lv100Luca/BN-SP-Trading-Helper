@@ -11,3 +11,5 @@ dist/
 *.spec
 release/
 .admin_token
+.idea/
+tools/records.json

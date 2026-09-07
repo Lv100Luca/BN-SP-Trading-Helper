@@ -4,9 +4,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import sqlite3
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
@@ -65,22 +66,6 @@ CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS readings (
-    id           INTEGER PRIMARY KEY,
-    ts           TEXT NOT NULL,
-    image        TEXT NOT NULL DEFAULT '',   -- file name inside the readings folder (see app/readings.py)
-    engine       TEXT NOT NULL DEFAULT '',
-    read_name    TEXT NOT NULL DEFAULT '',   -- what OCR produced ('' = nothing readable)
-    confidence   REAL NOT NULL DEFAULT 0,
-    alternatives TEXT NOT NULL DEFAULT '[]', -- JSON [[text, confidence], ...] of every row OCR found
-    region       TEXT NOT NULL DEFAULT '',   -- JSON [x, y, w, h] of the capture region at the time
-    preprocess   TEXT NOT NULL DEFAULT '',   -- JSON PreprocessConfig used for this read
-    source       TEXT NOT NULL DEFAULT '',   -- 'manual' (button / F5) or 'auto'
-    saved_name   TEXT NOT NULL DEFAULT '',   -- record name a state was saved under from this reading
-    saved_state  TEXT NOT NULL DEFAULT '',
-    fixed_name   TEXT NOT NULL DEFAULT '',   -- the name a human confirmed ('' = unchecked)
-    fixed_at     TEXT NOT NULL DEFAULT ''
-);
 CREATE TABLE IF NOT EXISTS global_records (   -- read-only copy of the shared table (see app/sync.py)
     name       TEXT PRIMARY KEY COLLATE NOCASE,
     name_key   TEXT NOT NULL,
@@ -100,18 +85,36 @@ CREATE TABLE IF NOT EXISTS sightings (        -- state timeline per record, olde
 );
 CREATE INDEX IF NOT EXISTS idx_sightings_record ON sightings(record_id, ts);
 CREATE TABLE IF NOT EXISTS pending_uploads (  -- saves waiting to be pushed to the global table
-    id    INTEGER PRIMARY KEY,
-    name  TEXT NOT NULL,
-    state TEXT NOT NULL,
-    notes TEXT NOT NULL DEFAULT '',
-    ts    TEXT NOT NULL,
-    kind  TEXT NOT NULL DEFAULT 'seen'
+    id       INTEGER PRIMARY KEY,
+    name     TEXT NOT NULL,
+    state    TEXT NOT NULL,
+    notes    TEXT NOT NULL DEFAULT '',
+    ts       TEXT NOT NULL,                   -- UTC, the server keeps it; Undo retracts by it
+    kind     TEXT NOT NULL DEFAULT 'seen',    -- seen | edit | retract | rename
+    new_name TEXT NOT NULL DEFAULT ''         -- rename only
 );
 """
 
 
 def _now() -> str:
     return datetime.now().isoformat(sep=" ", timespec="seconds")
+
+
+def _utc_now() -> str:
+    """Timestamp for the shared table: contributors sit in different time zones."""
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def to_local(ts: str) -> str:
+    """A server timestamp (UTC, '...Z') as local 'YYYY-MM-DD HH:MM:SS'; anything else is returned as is."""
+    s = (ts or "").strip()
+    if not s.endswith("Z"):
+        return s.replace("T", " ")
+    try:
+        dt = datetime.fromisoformat(s[:-1]).replace(tzinfo=timezone.utc).astimezone()
+    except ValueError:
+        return s
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
 def normalize_name(name: str) -> str:
@@ -176,10 +179,16 @@ class Database:
             ("global_records", "times_seen", "INTEGER NOT NULL DEFAULT 0"),
             ("global_records", "history", "TEXT NOT NULL DEFAULT '[]'"),
             ("pending_uploads", "kind", "TEXT NOT NULL DEFAULT 'seen'"),
+            ("pending_uploads", "new_name", "TEXT NOT NULL DEFAULT ''"),
         ):
             if column not in {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")}:
                 self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
                 self.conn.commit()
+        # The reading log (captures behind each read, pre-1.0) is gone; drop its table and images.
+        if self.conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'readings'").fetchone():
+            self.conn.execute("DROP TABLE readings")
+            self.conn.commit()
+            shutil.rmtree(self.path.parent / "readings", ignore_errors=True)
         row = self.conn.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'records'"
         ).fetchone()
@@ -306,6 +315,30 @@ class Database:
         ).fetchall()
         rows.reverse()
         return rows
+
+    def last_sighting_id(self, record_id: int) -> int | None:
+        row = self.conn.execute(
+            "SELECT id FROM sightings WHERE record_id = ? ORDER BY id DESC LIMIT 1", (record_id,)
+        ).fetchone()
+        return int(row["id"]) if row else None
+
+    def undo_save(self, name: str, sighting_id: int | None, prev: dict | None) -> None:
+        """Take back the encounter upsert() just recorded: drop its sighting and put the record back
+        to `prev` (its row before the save), or remove the record when the save created it."""
+        rec = self.get(name, loose=False)
+        if rec is None:
+            return
+        if sighting_id is not None:
+            self.conn.execute("DELETE FROM sightings WHERE id = ?", (sighting_id,))
+        if prev is None:
+            self.conn.execute("DELETE FROM sightings WHERE record_id = ?", (rec["id"],))
+            self.conn.execute("DELETE FROM records WHERE id = ?", (rec["id"],))
+        else:
+            self.conn.execute(
+                "UPDATE records SET state = ?, notes = ?, times_seen = ?, updated_at = ? WHERE id = ?",
+                (prev["state"], prev["notes"], prev["times_seen"], prev["updated_at"], rec["id"]),
+            )
+        self.conn.commit()
 
     def set_state(self, name: str, state: str) -> None:
         """Change the state of an existing record without counting an encounter."""
@@ -443,9 +476,6 @@ class Database:
                 ),
             )
             action = "merged"
-        self.conn.execute(
-            "UPDATE readings SET saved_name = ? WHERE saved_name = ? COLLATE NOCASE", (new, src["name"])
-        )
         self.conn.commit()
         return {"action": action, "old": src["name"], "name": new}
 
@@ -484,8 +514,9 @@ class Database:
                 seen = max(0, int(r.get("times_seen") or 0))
             except (TypeError, ValueError):
                 seen = 0
-            history = [h for h in (r.get("history") or []) if isinstance(h, list) and len(h) >= 2 and h[0] in STATES]
-            rows.append((name, name_key(name), state, str(r.get("notes") or ""), str(r.get("updated_at") or ""),
+            history = [[h[0], to_local(str(h[1])), *h[2:3]] for h in (r.get("history") or [])
+                       if isinstance(h, list) and len(h) >= 2 and h[0] in STATES]
+            rows.append((name, name_key(name), state, str(r.get("notes") or ""), to_local(str(r.get("updated_at") or "")),
                          seen, json.dumps(history)))
         with self.conn:  # one transaction: readers never see an empty table
             self.conn.execute("DELETE FROM global_records")
@@ -511,17 +542,28 @@ class Database:
             raw = json.loads(rec["history"] or "[]")
         except ValueError:
             return []
-        return [{"state": h[0], "ts": str(h[1]).replace("T", " ").rstrip("Z"), "kind": (h[2] if len(h) > 2 else "seen")}
+        return [{"state": h[0], "ts": str(h[1]), "kind": (h[2] if len(h) > 2 else "seen")}
                 for h in raw if isinstance(h, list) and len(h) >= 2 and h[0] in STATES]
 
     # Contributors (Settings tab: key + "upload my saves") queue every save here; App flushes the
-    # queue to the server on the sync interval and on exit. kind: "seen" (an encounter) or "edit".
-    def queue_upload(self, name: str, state: str, notes: str = "", kind: str = "seen") -> None:
-        self.conn.execute(
-            "INSERT INTO pending_uploads (name, state, notes, ts, kind) VALUES (?, ?, ?, ?, ?)",
-            (normalize_name(name), state, notes or "", _now(), kind),
+    # queue to the server on the sync interval and on exit. kind: "seen" (an encounter), "edit"
+    # (Records tab), "retract" (Undo of a pushed save, same name and ts) or "rename" (name -> new_name).
+    def queue_upload(self, name: str, state: str, notes: str = "", kind: str = "seen",
+                     ts: str | None = None, new_name: str = "") -> tuple[int, str]:
+        """Returns (row id, ts) so a save can be undone: dropped from the queue, or retracted by ts."""
+        ts = ts or _utc_now()
+        cur = self.conn.execute(
+            "INSERT INTO pending_uploads (name, state, notes, ts, kind, new_name) VALUES (?, ?, ?, ?, ?, ?)",
+            (normalize_name(name), state, notes or "", ts, kind, normalize_name(new_name)),
         )
         self.conn.commit()
+        return int(cur.lastrowid), ts
+
+    def delete_upload(self, upload_id: int) -> bool:
+        """Drop a queued save that has not been pushed yet. False if it is already gone."""
+        cur = self.conn.execute("DELETE FROM pending_uploads WHERE id = ?", (upload_id,))
+        self.conn.commit()
+        return cur.rowcount > 0
 
     def pending_uploads(self) -> list[sqlite3.Row]:
         return self.conn.execute("SELECT * FROM pending_uploads ORDER BY id").fetchall()
@@ -548,69 +590,6 @@ class Database:
             "synced_at": self.get_setting("global_synced_at", "") or "",
             "etag": self.get_setting("global_etag", "") or "",
         }
-
-    # ----------------------------------------------------------------- readings
-    # One row per capture the app took a name from; the image itself lives in a folder next to
-    # the database (app/readings.py owns the files, this is just the metadata).
-    def add_reading(self, *, engine: str, read_name: str, confidence: float, alternatives: list,
-                    region, preprocess: dict, source: str) -> int:
-        cur = self.conn.execute(
-            "INSERT INTO readings (ts, engine, read_name, confidence, alternatives, region, preprocess, source)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (_now(), engine, read_name, float(confidence), json.dumps(alternatives, ensure_ascii=False),
-             json.dumps(list(region)) if region else "", json.dumps(preprocess or {}), source),
-        )
-        self.conn.commit()
-        return int(cur.lastrowid)
-
-    def set_reading_image(self, rid: int, image: str) -> None:
-        self.conn.execute("UPDATE readings SET image = ? WHERE id = ?", (image, rid))
-        self.conn.commit()
-
-    def mark_reading_saved(self, rid: int, saved_name: str, saved_state: str) -> None:
-        self.conn.execute(
-            "UPDATE readings SET saved_name = ?, saved_state = ? WHERE id = ?", (saved_name, saved_state, rid)
-        )
-        self.conn.commit()
-
-    def fix_reading(self, rid: int, fixed_name: str) -> None:
-        """Store the human-verified name (equal to read_name = 'the read was right')."""
-        self.conn.execute(
-            "UPDATE readings SET fixed_name = ?, fixed_at = ? WHERE id = ?", (normalize_name(fixed_name), _now(), rid)
-        )
-        self.conn.commit()
-
-    def reading(self, rid: int) -> sqlite3.Row | None:
-        return self.conn.execute("SELECT * FROM readings WHERE id = ?", (rid,)).fetchone()
-
-    def readings(self, query: str = "", limit: int = 1000) -> list[sqlite3.Row]:
-        """Newest first. `query` matches the read, saved or fixed name."""
-        sql, params = "SELECT * FROM readings", []
-        if query:
-            sql += " WHERE read_name LIKE ? COLLATE NOCASE OR saved_name LIKE ? COLLATE NOCASE OR fixed_name LIKE ? COLLATE NOCASE"
-            params = [f"%{query}%"] * 3
-        sql += " ORDER BY id DESC LIMIT ?"
-        return self.conn.execute(sql, [*params, int(limit)]).fetchall()
-
-    def delete_readings(self, ids: Iterable[int]) -> list[str]:
-        """Remove rows; returns their image file names so the caller can delete the files."""
-        ids = [int(i) for i in ids]
-        if not ids:
-            return []
-        marks = ",".join("?" * len(ids))
-        images = [r["image"] for r in self.conn.execute(f"SELECT image FROM readings WHERE id IN ({marks})", ids)]
-        self.conn.execute(f"DELETE FROM readings WHERE id IN ({marks})", ids)
-        self.conn.commit()
-        return [i for i in images if i]
-
-    def stale_reading_ids(self, keep: int) -> list[int]:
-        """Ids of the oldest readings beyond the newest `keep` that nobody saved a state from or
-        checked -- the ones that can be thrown away to bound disk use."""
-        rows = self.conn.execute(
-            "SELECT id FROM readings WHERE saved_name = '' AND fixed_name = '' ORDER BY id DESC LIMIT -1 OFFSET ?",
-            (int(keep),),
-        ).fetchall()
-        return [r["id"] for r in rows]
 
     # ----------------------------------------------------------------- settings
     def get_setting(self, key: str, default: str | None = None) -> str | None:

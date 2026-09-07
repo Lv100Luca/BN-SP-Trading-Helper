@@ -7,8 +7,6 @@ Examples (run from the project root with the venv python):
   python tools/ocr_tune.py --scale 3 --threshold 140 --invert --save-debug
   python tools/ocr_tune.py --engine tesseract
   python tools/ocr_tune.py --scale 3 --save       # persist these options for the app
-  python tools/ocr_tune.py --readings             # re-run OCR over the captures the app logged
-                                                  # (Readings tab); names you fixed there are the labels
 
 Optional samples/labels.txt (one per line, "filename<TAB>expected name" or
 "filename=expected name") turns the run into an accuracy check.
@@ -28,7 +26,6 @@ from PIL import Image  # noqa: E402
 
 from app import capture, ocr  # noqa: E402
 from app.db import Database, name_key  # noqa: E402
-from app.readings import READINGS_DIR  # noqa: E402
 
 SAMPLES = ROOT / "samples"
 DEBUG_DIR = SAMPLES / "_debug"
@@ -53,11 +50,6 @@ def load_labels() -> dict[str, str]:
         fname, expected = line.split(sep, 1)
         labels[fname.strip()] = expected.strip()
     return labels
-
-
-def reading_labels(db: Database) -> dict[str, str]:
-    """image file -> name a human confirmed or fixed in the app's Readings tab."""
-    return {r["image"]: r["fixed_name"] for r in db.readings(limit=100000) if r["image"] and r["fixed_name"]}
 
 
 def parse_region(text: str) -> tuple[int, int, int, int]:
@@ -107,9 +99,6 @@ def main() -> int:
                     help=f"extra real pixels grabbed around --region, as the app does "
                          f"(default {capture.GRAB_MARGIN}; use 0 to crop exactly)")
     ap.add_argument("--only", help="only process files whose name contains this text")
-    ap.add_argument("--readings", action="store_true",
-                    help=f"use the app's logged captures ({READINGS_DIR}) instead of samples/: already "
-                         f"cropped, so no region/margin; names fixed or confirmed in the Readings tab act as labels")
     args = ap.parse_args()
 
     db = Database()
@@ -123,8 +112,6 @@ def main() -> int:
     )
 
     region = None
-    if args.readings:
-        args.full = True
     if not args.full and args.rel_region is None:
         region = args.region
         if region is None:
@@ -134,13 +121,11 @@ def main() -> int:
         if region is None:
             print("No region given and none saved by the app; OCR-ing whole images (use --region x,y,w,h).")
 
-    source_dir = READINGS_DIR if args.readings else SAMPLES
-    files = sorted(p for p in source_dir.iterdir() if p.is_file() and p.suffix.lower() in EXTS) if source_dir.is_dir() else []
+    files = sorted(p for p in SAMPLES.iterdir() if p.is_file() and p.suffix.lower() in EXTS) if SAMPLES.is_dir() else []
     if args.only:
         files = [p for p in files if args.only.lower() in p.name.lower()]
     if not files:
-        hint = "Run the app from source and read some names first." if args.readings else "Drop some screenshots there first."
-        print(f"No images found in {source_dir}. {hint}")
+        print(f"No images found in {SAMPLES}. Drop some screenshots there first.")
         return 1
 
     margin = capture.GRAB_MARGIN if args.margin is None else args.margin
@@ -149,7 +134,7 @@ def main() -> int:
     engine = ocr.make_engine(args.engine)
     print(f"loaded {engine.name} in {time.perf_counter() - t0:.1f}s\n")
 
-    labels = reading_labels(db) if args.readings else load_labels()
+    labels = load_labels()
     hits = loose_hits = labelled = 0
     if args.save_debug:
         DEBUG_DIR.mkdir(exist_ok=True)

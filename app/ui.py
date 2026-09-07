@@ -1,24 +1,21 @@
-"""Tkinter UI: Home tab (capture -> OCR -> previous record -> save state), Records tab and, when the
-reading log is on (running from source), a Readings tab to review captures and fix misreads."""
+"""Tkinter UI: Home tab (capture -> OCR -> previous record -> save state), Records tab (search,
+rename, set state, export) and Settings (global table, contributing)."""
 from __future__ import annotations
 
 import json
-import os
 import queue
 import re
-import subprocess
 import sys
 import threading
 import time
 import tkinter as tk
 import webbrowser
-from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import numpy as np
 from PIL import Image, ImageTk
 
-from . import REPO_URL, __version__, capture, export, ocr, readings, sync
+from . import REPO_URL, __version__, capture, export, ocr, sync
 from .db import STATES, Database, name_key
 
 STATE_LABELS = {"trading": "TRADING", "fighting": "FIGHTING", "afk": "AFK", "fake": "FAKE"}
@@ -167,9 +164,6 @@ class App(tk.Tk):
             pass
 
         self.db = Database()
-        # Running from source: keep every capture a name was read from, so misreads can be
-        # inspected and repaired later (Readings tab). Off in the packaged exe unless forced on.
-        self.log: readings.ReadingLog | None = readings.ReadingLog(self.db) if readings.enabled() else None
         self.engine: ocr.OcrEngine | None = None
         self._engine_lock = threading.Lock()
         self.region: capture.Region | None = self._load_region()
@@ -190,10 +184,6 @@ class App(tk.Tk):
         self.records = RecordsTab(self.nb, self)
         self.nb.add(self.home, text="   Home   ")
         self.nb.add(self.records, text="   Records   ")
-        self.readings_tab: ReadingsTab | None = None
-        if self.log is not None:
-            self.readings_tab = ReadingsTab(self.nb, self)
-            self.nb.add(self.readings_tab, text="   Readings   ")
         self.settings = SettingsTab(self.nb, self)
         self.nb.add(self.settings, text="   Settings   ")
         self.nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
@@ -206,6 +196,7 @@ class App(tk.Tk):
         self._sync_results: queue.Queue = queue.Queue()
         self._sync_busy = False
         self._push_busy = False
+        self._inflight: set[int] = set()   # pending_uploads ids the push in progress carries
         self._last_sync = time.monotonic()
         self._refresh_global_label()
         if sync.table_url():
@@ -251,16 +242,23 @@ class App(tk.Tk):
             return
         if kind in ("push_ok", "push_error"):
             self._push_busy = False
+            self._inflight = set()
             self.settings.set_upload_enabled(True)
             if kind == "push_error":
-                msg, then_fetch = payload
+                msg, then_fetch, rejected = payload
+                if rejected:
+                    self.settings.key_rejected()
                 self.set_status(f"Upload to the global table failed: {msg}")
             else:
                 ids, report, then_fetch = payload
                 self.db.clear_uploads(ids)
+                extra = "".join(
+                    f", {report[k]} {what}" for k, what in (("retracted", "taken back"), ("renamed", "renamed"))
+                    if report.get(k)
+                )
                 self.set_status(
-                    f"Uploaded {len(ids)} save(s) to the global table: {report.get('added', 0)} new, "
-                    f"{report.get('updated', 0)} changed, {report.get('unchanged', 0)} already known."
+                    f"Uploaded {len(ids)} change(s) to the global table: {report.get('added', 0)} new, "
+                    f"{report.get('updated', 0)} changed, {report.get('unchanged', 0)} already known{extra}."
                 )
             self.settings.refresh_pending_label()
             if then_fetch:
@@ -292,12 +290,44 @@ class App(tk.Tk):
     def sharing(self) -> bool:
         return self.db.get_setting("share_uploads") == "1" and bool(self.db.get_setting("contrib_key"))
 
-    def record_saved(self, name: str, state: str, notes: str = "", kind: str = "seen") -> None:
-        """Called after every state save; queues it for the global table when sharing is on.
-        kind "seen" is an encounter (Home), "edit" a correction (Records tab)."""
-        if self.sharing():
-            self.db.queue_upload(name, state, notes, kind)
-            self.settings.refresh_pending_label()
+    def record_saved(self, name: str, state: str, notes: str = "", kind: str = "seen",
+                     new_name: str = "") -> tuple[int | None, str | None]:
+        """Called after every change to a record; queues it for the global table when sharing is on.
+        kind "seen" is an encounter (Home), "edit" a correction and "rename" a fix of the name
+        (Records tab). Returns the queue row's (id, ts), or (None, None) when nothing was queued."""
+        if not self.sharing():
+            return None, None
+        upload_id, ts = self.db.queue_upload(name, state, notes, kind, new_name=new_name)
+        self.settings.refresh_pending_label()
+        return upload_id, ts
+
+    def retract_upload(self, upload_id: int, name: str, state: str, ts: str) -> None:
+        """Undo of a save that was queued for the global table: drop it from the queue while it is
+        still there; once pushed (or in flight right now) ask the server to take it back instead."""
+        if upload_id in self._inflight or not self.db.delete_upload(upload_id):
+            self.db.queue_upload(name, state, "", "retract", ts=ts)
+        self.settings.refresh_pending_label()
+
+    def run_bg(self, work, done) -> None:
+        """Run `work()` in a thread and hand (result, exception) to `done` on the UI thread."""
+        box: queue.Queue = queue.Queue()
+
+        def runner() -> None:  # no tkinter or sqlite calls in here
+            try:
+                box.put((work(), None))
+            except Exception as exc:  # noqa: BLE001
+                box.put((None, exc))
+
+        def poll() -> None:
+            try:
+                result, exc = box.get_nowait()
+            except queue.Empty:
+                self.after(100, poll)
+                return
+            done(result, exc)
+
+        threading.Thread(target=runner, daemon=True).start()
+        self.after(100, poll)
 
     def _sync_tick(self) -> None:
         self.after(30_000, self._sync_tick)
@@ -323,16 +353,16 @@ class App(tk.Tk):
         self._push_busy = True
         self.settings.set_upload_enabled(False)
         ids = [r["id"] for r in rows]
-        records = [{"name": r["name"], "state": r["state"], "notes": r["notes"], "ts": r["ts"], "kind": r["kind"]}
-                   for r in rows]
+        self._inflight = set(ids)
+        records = [_upload_payload(r) for r in rows]
 
         def work() -> None:  # no tkinter or sqlite calls in here
             try:
                 self._sync_results.put(("push_ok", (ids, sync.push_records(url, key, records), then_fetch)))
             except sync.SyncError as exc:
-                self._sync_results.put(("push_error", (str(exc), then_fetch)))
+                self._sync_results.put(("push_error", (str(exc), then_fetch, isinstance(exc, sync.AuthError))))
             except Exception as exc:  # noqa: BLE001
-                self._sync_results.put(("push_error", (f"{type(exc).__name__}: {exc}", then_fetch)))
+                self._sync_results.put(("push_error", (f"{type(exc).__name__}: {exc}", then_fetch, False)))
 
         threading.Thread(target=work, daemon=True).start()
         self.after(100, self._poll_sync)
@@ -340,12 +370,11 @@ class App(tk.Tk):
     def _flush_on_exit(self) -> None:
         """Best effort: push what is queued before the window goes away (short timeout)."""
         rows = self.db.pending_uploads()
-        if not rows or not self.sharing():
+        if not rows or not self.sharing() or self._push_busy:   # a push in flight would double-count
             return
         try:
             sync.push_records(sync.table_url(), self.db.get_setting("contrib_key", "") or "",
-                              [{"name": r["name"], "state": r["state"], "notes": r["notes"], "ts": r["ts"],
-                                "kind": r["kind"]} for r in rows], timeout=4)
+                              [_upload_payload(r) for r in rows], timeout=4)
             self.db.clear_uploads(r["id"] for r in rows)
         except Exception:  # noqa: BLE001  - stays queued for the next run
             pass
@@ -379,11 +408,8 @@ class App(tk.Tk):
         self.status.set(text)
 
     def _on_tab_changed(self, _e: tk.Event) -> None:
-        tab = self.nb.nametowidget(self.nb.select())
-        if tab is self.records:
+        if self.nb.nametowidget(self.nb.select()) is self.records:
             self.records.refresh()
-        elif tab is self.readings_tab:
-            self.readings_tab.refresh()
 
     def _load_region(self) -> capture.Region | None:
         raw = self.db.get_setting("region")
@@ -417,6 +443,11 @@ class App(tk.Tk):
         self.destroy()
 
 
+def _upload_payload(r) -> dict:
+    return {"name": r["name"], "state": r["state"], "notes": r["notes"], "ts": r["ts"], "kind": r["kind"],
+            "new_name": r["new_name"]}
+
+
 # ============================================================================ Home
 class HomeTab(ttk.Frame):
     def __init__(self, master: tk.Misc, app: App) -> None:
@@ -433,7 +464,7 @@ class HomeTab(ttk.Frame):
         self._candidate = ""            # name seen once, waiting for a confirming read
         self._last_fp: np.ndarray | None = None
         self._last_result: tuple | None = None
-        self.reading_id: int | None = None  # log row of the capture the current name came from
+        self._last_save: dict | None = None  # what Undo takes back (see save_state)
         self._auto_var = tk.BooleanVar(value=app.db.get_setting("auto_read", "1") == "1")
         try:
             interval = float(app.db.get_setting("auto_interval", "1.0") or 1.0)
@@ -501,7 +532,7 @@ class HomeTab(ttk.Frame):
         self.prev_history_lbl = tk.Label(self.prev_frame, text="", justify="left", anchor="w", font=("", 8))
         self.prev_history_lbl.pack(fill="x")
 
-        ttk.Label(self, text="Record current state (overwrites the previous one):").pack(anchor="w", pady=(8, 2))
+        ttk.Label(self, text="Record the current state (added to this player's history):").pack(anchor="w", pady=(8, 2))
         row = ttk.Frame(self)
         row.pack(fill="x")
         for st in STATES:
@@ -511,6 +542,8 @@ class HomeTab(ttk.Frame):
                 activebackground=STATE_COLORS[st], activeforeground=STATE_FG[st],
                 command=lambda s=st: self.save_state(s),
             ).pack(side="left", fill="x", expand=True, padx=3)
+        self.undo_btn = ttk.Button(self, text="Undo last save", command=self.undo_save, state="disabled")
+        self.undo_btn.pack(anchor="e", pady=(6, 0))
 
     # ------------------------------------------------------------------ region
     def _refresh_region_label(self) -> None:
@@ -605,8 +638,7 @@ class HomeTab(ttk.Frame):
         else:
             self._on_ocr_done(*item[1:])
 
-    def _on_ocr_done(self, engine_name: str, name: str, conf: float, lines: list[ocr.OcrLine], img) -> None:
-        self._log_reading(img, engine_name, name, conf, lines, "manual")  # manual reads are always kept
+    def _on_ocr_done(self, engine_name: str, name: str, conf: float, lines: list[ocr.OcrLine], _img) -> None:
         if not name:
             self.ocr_info.set(f"[{engine_name}] no text found")
             self.app.set_status("OCR found no text. Check the region with 'Test capture'.")
@@ -625,18 +657,6 @@ class HomeTab(ttk.Frame):
     @staticmethod
     def _alts(lines: list[ocr.OcrLine]) -> str:
         return "  |  ".join(f"{l.text} ({l.confidence:.2f})" for l in lines[:4])
-
-    def _log_reading(self, img, engine_name: str, name: str, conf: float, lines: list[ocr.OcrLine], source: str) -> None:
-        """Remember this capture as the origin of the name now in the box (no-op when the log is off)."""
-        if self.app.log is None or img is None:
-            return
-        try:
-            self.reading_id = self.app.log.add(
-                img, engine=engine_name, name=name, conf=conf, lines=lines,
-                region=self.app.region, cfg=self.app.pre_cfg, source=source,
-            )
-        except Exception as exc:  # noqa: BLE001 - a debugging aid must never break a read
-            print(f"reading log failed: {exc}", file=sys.stderr)
 
     # --------------------------------------------------------------- auto-read
     def _set_auto(self, on: bool) -> None:
@@ -720,7 +740,6 @@ class HomeTab(ttk.Frame):
             self.auto_status.set(f"{stamp}  saw '{name}' (paused while you type)")
             return
         self._candidate = ""
-        self._log_reading(img, engine_name, name, conf, lines, "auto")  # only the read that switched the name
         self.name_var.set(name)
         self.lookup()
         self.ocr_info.set(f"[{engine_name}] " + self._alts(lines))
@@ -729,8 +748,7 @@ class HomeTab(ttk.Frame):
 
     # ----------------------------------------------------------------- records
     def set_name(self, name: str) -> None:
-        """Put a name in the box that did not come from the last capture (Records / Readings tab)."""
-        self.reading_id = None
+        """Put a name in the box that did not come from the last capture (Records tab)."""
         self.name_var.set(name)
         self.lookup()
 
@@ -811,9 +829,12 @@ class HomeTab(ttk.Frame):
             return
         prev = self.app.db.get(name)
         rec = self.app.db.upsert(name, state)
-        self.app.record_saved(rec["name"], state, rec["notes"])
-        if self.app.log is not None and self.reading_id is not None:
-            self.app.db.mark_reading_saved(self.reading_id, rec["name"], state)
+        upload_id, ts = self.app.record_saved(rec["name"], state, rec["notes"])
+        self._last_save = {
+            "name": rec["name"], "state": state, "prev": dict(prev) if prev is not None else None,
+            "sighting_id": self.app.db.last_sighting_id(rec["id"]), "upload_id": upload_id, "ts": ts,
+        }
+        self._refresh_undo()
         self._show_prev(rec, name, "local", other=self.app.db.get_global(name))
         if prev is not None and prev["state"] != state:
             self.app.set_status(
@@ -821,6 +842,34 @@ class HomeTab(ttk.Frame):
             )
         else:
             self.app.set_status(f"{rec['name']}: saved as {STATE_LABELS[state]}")
+
+    def undo_save(self) -> None:
+        """Take back the last state saved here or on the mini HUD: the sighting and encounter count
+        locally and, for contributors, the queued or already pushed upload."""
+        ls = self._last_save
+        if ls is None:
+            return
+        self._last_save = None
+        self.app.db.undo_save(ls["name"], ls["sighting_id"], ls["prev"])
+        if ls["upload_id"] is not None:
+            self.app.retract_upload(ls["upload_id"], ls["name"], ls["state"], ls["ts"])
+        self._refresh_undo()
+        self.lookup(quiet=True)
+        back = f"back to {STATE_LABELS[ls['prev']['state']]}" if ls["prev"] else "record removed"
+        self.app.set_status(f"Undone: {ls['name']} {STATE_LABELS[ls['state']]} ({back}).")
+
+    def forget_undo(self, name: str) -> None:
+        """The record was renamed or deleted elsewhere; the last save can no longer be undone."""
+        if self._last_save is not None and name_key(self._last_save["name"]) == name_key(name):
+            self._last_save = None
+            self._refresh_undo()
+
+    def _refresh_undo(self) -> None:
+        ls = self._last_save
+        text = f"Undo: {ls['name']} {STATE_LABELS[ls['state']]}" if ls else "Undo last save"
+        self.undo_btn.configure(text=text, state="normal" if ls else "disabled")
+        if self.app.mini is not None:
+            self.app.mini.set_undo(ls is not None)
 
 
 # ========================================================================= Records
@@ -888,6 +937,7 @@ class RecordsTab(ttk.Frame):
         btns = ttk.Frame(self)
         btns.pack(fill="x", pady=(8, 0))
         ttk.Button(btns, text="Load into Home", command=self.load_selected).pack(side="left")
+        ttk.Button(btns, text="Rename...", command=self.rename_selected).pack(side="left", padx=(6, 0))
         ttk.Label(btns, text="Set:").pack(side="left", padx=(10, 0))
         for st in STATES:
             tk.Button(
@@ -897,8 +947,7 @@ class RecordsTab(ttk.Frame):
             ).pack(side="left", padx=(4, 0))
         tools = ttk.Frame(self)
         tools.pack(fill="x", pady=(6, 0))
-        ttk.Button(tools, text="Import...", command=self.import_rows).pack(side="left")
-        ttk.Button(tools, text="Export...", command=self.export_rows).pack(side="left", padx=(6, 0))
+        ttk.Button(tools, text="Export...", command=self.export_rows).pack(side="left")
         ttk.Button(tools, text="Delete", command=self.delete_selected).pack(side="right")
         ttk.Button(tools, text="Refresh", command=self.refresh).pack(side="right", padx=(0, 6))
 
@@ -957,8 +1006,11 @@ class RecordsTab(ttk.Frame):
         return rows, (q == "" and f == "all")
 
     def export_rows(self) -> None:
-        """Save the rows currently listed (all records unless a search/filter is active) as JSON (or CSV)."""
-        rows, is_everything = self._current_rows()
+        """Save your own records (the current search/filter applied, never the global table's copy)
+        as JSON (or CSV)."""
+        q, f = self.search_var.get().strip(), self.filter_var.get()
+        rows = self.app.db.all(q, None if f == "all" else f, "local")
+        is_everything = q == "" and f == "all"
         if not rows:
             messagebox.showinfo("Export", "No records to export.")
             return
@@ -974,27 +1026,8 @@ class RecordsTab(ttk.Frame):
         except OSError as exc:
             messagebox.showerror("Export failed", str(exc))
             return
-        scope = "all records" if is_everything else "the records currently shown"
+        scope = "all your records" if is_everything else "your records currently matching"
         self.app.set_status(f"Exported {n} ({scope}) to {path}")
-
-    def import_rows(self) -> None:
-        """Merge records from a JSON (or CSV) export or another records.sqlite into this database."""
-        path = filedialog.askopenfilename(
-            parent=self, title="Import records",
-            filetypes=[("JSON", "*.json"), ("CSV", "*.csv"), ("SQLite database", "*.sqlite"), ("All files", "*.*")],
-        )
-        if not path:
-            return
-        try:
-            report = self.app.db.merge_records(export.read_records(path))
-        except Exception as exc:  # noqa: BLE001
-            messagebox.showerror("Import failed", str(exc))
-            return
-        self.refresh()
-        self.app.set_status(
-            f"Imported from {Path(path).name}: {report['added']} added, {report['updated']} updated, "
-            f"{report['unchanged']} unchanged, {report['skipped']} skipped"
-        )
 
     def _selected_names(self) -> list[str]:
         return [self.tree.item(i, "values")[0] for i in self.tree.selection()]
@@ -1009,6 +1042,43 @@ class RecordsTab(ttk.Frame):
             return
         self.app.home.set_name(names[0])
         self.app.nb.select(0)
+
+    def rename_selected(self) -> None:
+        """Fix a name OCR got wrong. If the new name already has a record the two are merged after
+        asking. Contributors' sightings follow the name in the global table too."""
+        picked = self._selected()
+        if len(picked) != 1 or picked[0][1] != "local":
+            messagebox.showinfo("Rename", "Select exactly one of your own records.", parent=self)
+            return
+        src = self.app.db.get(picked[0][0], loose=False)
+        if src is None:
+            return
+        new = simpledialog.askstring("Rename record", f"Correct name for '{src['name']}':",
+                                     initialvalue=src["name"], parent=self)
+        new = " ".join((new or "").split())
+        if not new or new == src["name"]:
+            return
+        dst = self.app.db.get(new)
+        if dst is not None and dst["id"] != src["id"] and not messagebox.askyesno(
+            "Rename record",
+            f"'{dst['name']}' already has a record ({STATE_LABELS[dst['state']]}, seen {dst['times_seen']}x).\n\n"
+            f"Merge '{src['name']}' ({STATE_LABELS[src['state']]}, seen {src['times_seen']}x) into it?",
+            parent=self,
+        ):
+            return
+        try:
+            result = self.app.db.rename_record(src["name"], new)
+        except (ValueError, LookupError) as exc:
+            messagebox.showerror("Rename record", str(exc), parent=self)
+            return
+        if result["action"] != "unchanged":
+            rec = self.app.db.get(new, loose=False)
+            self.app.record_saved(src["name"], rec["state"], rec["notes"], kind="rename", new_name=new)
+        self.app.home.forget_undo(src["name"])
+        self.refresh()
+        if name_key(self.app.home.name_var.get()) == name_key(src["name"]):
+            self.app.home.set_name(new)
+        self.app.set_status(f"{src['name']} {result['action']} -> {new}")
 
     def set_selected_state(self, state: str) -> None:
         """Own records change state in place. A global row cannot be edited, so setting a state on
@@ -1042,6 +1112,7 @@ class RecordsTab(ttk.Frame):
             return
         for n in names:
             self.app.db.delete(n)
+            self.app.home.forget_undo(n)
         self.refresh()
         note = f" ({skipped} global table entries skipped)" if skipped else ""
         self.app.set_status(f"Deleted {len(names)} record(s){note}.")
@@ -1126,16 +1197,20 @@ class SettingsTab(ttk.Frame):
         ttk.Checkbutton(row, text="show", variable=self.show_key_var,
                         command=lambda: self.key_entry.configure(show="" if self.show_key_var.get() else "*")
                         ).pack(side="left", padx=(6, 0))
-        ttk.Button(row, text="Save key", command=self._save_key).pack(side="left", padx=(6, 0))
+        self.key_btn = ttk.Button(row, text="Save key", command=self._save_key)
+        self.key_btn.pack(side="left", padx=(6, 0))
         row = ttk.Frame(box)
         row.pack(fill="x", pady=(8, 0))
         self.share_var = tk.BooleanVar(value=db.get_setting("share_uploads", "0") == "1")
-        ttk.Checkbutton(row, text="Upload my saves", variable=self.share_var, command=self._toggle_share
-                        ).pack(side="left")
+        self.share_chk = ttk.Checkbutton(row, text="Upload my saves", variable=self.share_var,
+                                         command=self._toggle_share)
+        self.share_chk.pack(side="left")
         self.pending_var = tk.StringVar()
-        ttk.Label(row, textvariable=self.pending_var, foreground="#666").pack(side="left", padx=(16, 0))
+        self.pending_lbl = ttk.Label(row, textvariable=self.pending_var, foreground="#666")
+        self.pending_lbl.pack(side="left", padx=(16, 0))
         self.upload_btn = ttk.Button(row, text="Upload now", command=self.app.push_uploads)
         self.upload_btn.pack(side="right")
+        self._rejected = False   # the server answered 401 to an upload this session
         self.refresh_pending_label()
 
     def _set_interval(self) -> None:
@@ -1147,35 +1222,84 @@ class SettingsTab(ttk.Frame):
         self.app.db.set_setting("sync_interval", str(minutes))
 
     def _save_key(self) -> None:
+        """The key is checked with the server first (GET /v1/keys/me) and only saved when it is known
+        there, so 'Upload my saves' can never be on with a key that does not work."""
         key = "".join(self.key_var.get().split())
-        if key and not re.fullmatch(r"tck_[0-9a-f]{48}", key):
+        if not key:
+            self.app.db.set_setting("contrib_key", "")
+            self.app.db.set_setting("contrib_label", "")
+            self.app.db.set_setting("share_uploads", "0")
+            self.share_var.set(False)
+            self.app.set_status("Contributor key removed.")
+            self.refresh_pending_label()
+            return
+        if not re.fullmatch(r"tck_[0-9a-f]{48}", key):
             messagebox.showerror("Contributor key", "That is not a contributor key. It looks like "
                                  "tck_ followed by 48 hex characters and is printed once by "
-                                 "tools/manage_keys.py create.")
+                                 "tools/manage_keys.py create.", parent=self)
             return
         self.key_var.set(key)
-        self.app.db.set_setting("contrib_key", key)
-        self.app.set_status("Contributor key saved." if key else "Contributor key removed.")
+        url = sync.table_url()
+        self.key_btn.configure(state="disabled", text="Checking...")
+        self.app.set_status("Checking the contributor key with the server...")
+
+        def done(info, exc) -> None:
+            self.key_btn.configure(state="normal", text="Save key")
+            if isinstance(exc, sync.AuthError):
+                messagebox.showerror("Contributor key", "The server does not know this key. Check it for "
+                                     "typos or ask the table admin for a new one.", parent=self)
+                self.app.set_status("Contributor key rejected by the server; not saved.")
+                return
+            if exc is not None:
+                messagebox.showerror("Contributor key", f"Could not check the key: {exc}", parent=self)
+                self.app.set_status("Contributor key not checked; not saved.")
+                return
+            label = str(info.get("label") or "") if isinstance(info, dict) else ""
+            self.app.db.set_setting("contrib_key", key)
+            self.app.db.set_setting("contrib_label", label)
+            self._rejected = False
+            who = f" for {label}" if label else ""
+            self.app.set_status(f"Contributor key{who} accepted. Tick 'Upload my saves' to start sharing.")
+            self.refresh_pending_label()
+
+        self.app.run_bg(lambda: sync.check_key(url, key), done)
+
+    def key_rejected(self) -> None:
+        """An upload came back 401: the key was revoked. Stop sharing until a working key is saved."""
+        self.app.db.set_setting("share_uploads", "0")
+        self.share_var.set(False)
+        self._rejected = True
         self.refresh_pending_label()
 
     def _toggle_share(self) -> None:
         on = self.share_var.get()
-        self.app.db.set_setting("share_uploads", "1" if on else "0")
         if on and not (self.app.db.get_setting("contrib_key") or ""):
-            self.app.set_status("Enter and save a contributor key first; saves are queued once one is set.")
+            self.share_var.set(False)
+            on = False
+            self.app.set_status("Enter and save a contributor key first.")
+        self.app.db.set_setting("share_uploads", "1" if on else "0")
         self.refresh_pending_label()
 
     def refresh_pending_label(self) -> None:
         if not hasattr(self, "pending_var"):
             return
         n = self.app.db.pending_upload_count()
-        if not self.share_var.get():
-            text = "Uploads off." if not n else f"Uploads off; {n} save(s) still queued."
-        elif not (self.app.db.get_setting("contrib_key") or ""):
+        key = self.app.db.get_setting("contrib_key") or ""
+        label = self.app.db.get_setting("contrib_label") or ""
+        who = f"Key of {label}.  " if label else ""
+        queued = f"{n} change(s) queued" if n else "nothing queued"
+        color = "#666"
+        if not key:
             text = "No key saved."
+        elif self._rejected:
+            text, color = f"The server rejected your key; uploads are off ({queued}). Save a working key.", "#c62828"
+        elif not self.share_var.get():
+            text = f"{who}Uploads off; {queued}."
         else:
-            text = "Nothing queued." if not n else f"{n} save(s) queued for the next upload."
+            text = f"{who}{queued.capitalize()}" + (" for the next upload." if n else ".")
         self.pending_var.set(text)
+        self.pending_lbl.configure(foreground=color)
+        self.share_chk.configure(state="normal" if key else "disabled")
         self.upload_btn.configure(state="normal" if (n and self.app.sharing()) else "disabled")
 
     def set_upload_enabled(self, on: bool) -> None:
@@ -1205,253 +1329,6 @@ class SettingsTab(ttk.Frame):
     def set_refresh_enabled(self, on: bool) -> None:
         if self.global_btn is not None:
             self.global_btn.configure(state="normal" if on else "disabled")
-
-
-# ======================================================================== Readings
-class ReadingsTab(ttk.Frame):
-    """Every capture the app took a name from (running from source only). Pick one, look at the
-    image, and either confirm the read or type the right name: the fix is stored on the reading
-    and, if a state was saved from it, the record is renamed (or merged into the correct one)."""
-
-    def __init__(self, master: tk.Misc, app: App) -> None:
-        super().__init__(master, padding=10)
-        self.app = app
-        self._img: ImageTk.PhotoImage | None = None
-        self._build()
-        self.refresh()
-
-    def _build(self) -> None:
-        ttk.Label(
-            self, foreground="#666", wraplength=620, justify="left",
-            text="Captures behind every name the app read (kept because you run from source). Select a row to "
-                 "see the image; type the real name and click Fix to correct it - a record saved under the "
-                 "misread is renamed too.",
-        ).pack(anchor="w", pady=(0, 6))
-        top = ttk.Frame(self)
-        top.pack(fill="x")
-        ttk.Label(top, text="Search:").pack(side="left")
-        self.search_var = tk.StringVar()
-        self.search_var.trace_add("write", lambda *_: self.refresh())
-        ttk.Entry(top, textvariable=self.search_var).pack(side="left", fill="x", expand=True, padx=6)
-        self.filter_var = tk.StringVar(value="all")
-        combo = ttk.Combobox(top, textvariable=self.filter_var, state="readonly", width=10,
-                             values=("all", "saved", "unchecked", "fixed"))
-        combo.pack(side="left")
-        combo.bind("<<ComboboxSelected>>", lambda _e: self.refresh())
-
-        self.count_var = tk.StringVar()
-        ttk.Label(self, textvariable=self.count_var, foreground="#666").pack(anchor="w", pady=(6, 2))
-
-        table = ttk.Frame(self)
-        table.pack(fill="both", expand=True)
-        cols = ("time", "read", "conf", "src", "saved", "state", "check")
-        self.tree = ttk.Treeview(table, columns=cols, show="headings", selectmode="extended", height=9)
-        for col, text, width, anchor in (
-            ("time", "Time", 125, "w"),
-            ("read", "Read as", 170, "w"),
-            ("conf", "Conf", 50, "center"),
-            ("src", "Via", 55, "center"),
-            ("saved", "Saved as", 150, "w"),
-            ("state", "State", 75, "center"),
-            ("check", "Check", 150, "w"),
-        ):
-            self.tree.heading(col, text=text)
-            self.tree.column(col, width=width, anchor=anchor, stretch=col in ("read", "saved", "check"))
-        self.tree.tag_configure("fixed", foreground="#c62828")
-        self.tree.tag_configure("ok", foreground="#2e7d32")
-        self.tree.tag_configure("empty", foreground="#9e9e9e")
-        sb = ttk.Scrollbar(table, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=sb.set)
-        self.tree.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
-        self.tree.bind("<<TreeviewSelect>>", self._on_select)
-        self.tree.bind("<Delete>", self.delete_selected)
-
-        self.preview = ttk.Label(self, anchor="center", relief="groove", text="(select a reading)")
-        self.preview.pack(fill="x", pady=(8, 2), ipady=6)
-        self.detail_var = tk.StringVar()
-        ttk.Label(self, textvariable=self.detail_var, foreground="#666", wraplength=620, justify="left").pack(anchor="w")
-
-        row = ttk.Frame(self)
-        row.pack(fill="x", pady=(8, 0))
-        ttk.Label(row, text="Correct name:").pack(side="left")
-        self.fix_var = tk.StringVar()
-        entry = ttk.Entry(row, textvariable=self.fix_var, font=("", 11))
-        entry.pack(side="left", fill="x", expand=True, padx=6)
-        entry.bind("<Return>", lambda _e: self.fix_selected())
-        tk.Button(row, text="Fix", font=("", 10, "bold"), bg="#1565c0", fg="white",
-                  activebackground="#0d47a1", activeforeground="white", padx=12,
-                  command=self.fix_selected).pack(side="left")
-        ttk.Button(row, text="Read was right", command=self.confirm_selected).pack(side="left", padx=(6, 0))
-
-        tools = ttk.Frame(self)
-        tools.pack(fill="x", pady=(6, 0))
-        ttk.Button(tools, text="Load into Home", command=self.load_selected).pack(side="left")
-        ttk.Button(tools, text="Open folder", command=self.open_folder).pack(side="left", padx=(6, 0))
-        ttk.Button(tools, text="Delete", command=self.delete_selected).pack(side="right")
-        ttk.Button(tools, text="Refresh", command=self.refresh).pack(side="right", padx=(0, 6))
-
-    # ------------------------------------------------------------------- table
-    @staticmethod
-    def _is_fixed(r) -> bool:
-        """True when a human changed the name (as opposed to confirming or not checking it)."""
-        return bool(r["fixed_name"]) and r["fixed_name"].lower() != (r["read_name"] or "").lower()
-
-    def refresh(self) -> None:
-        rows = self.app.db.readings(self.search_var.get().strip())
-        f = self.filter_var.get()
-        if f == "saved":
-            rows = [r for r in rows if r["saved_name"]]
-        elif f == "unchecked":
-            rows = [r for r in rows if not r["fixed_name"]]
-        elif f == "fixed":
-            rows = [r for r in rows if self._is_fixed(r)]
-        selected = set(self.tree.selection())
-        self.tree.delete(*self.tree.get_children())
-        for r in rows:
-            if not r["fixed_name"]:
-                check, tags = "", (("empty",) if not r["read_name"] else ())
-            elif self._is_fixed(r):
-                check, tags = f"-> {r['fixed_name']}", ("fixed",)
-            else:
-                check, tags = "ok", ("ok",)
-            self.tree.insert(
-                "", "end", iid=str(r["id"]),
-                values=(r["ts"], r["read_name"] or "(nothing readable)", f"{r['confidence']:.2f}", r["source"],
-                        r["saved_name"], STATE_LABELS.get(r["saved_state"], ""), check),
-                tags=tags,
-            )
-        keep = [str(r["id"]) for r in rows if str(r["id"]) in selected]
-        if keep:
-            self.tree.selection_set(keep)
-        else:
-            self._show(None)
-        n_saved = sum(1 for r in rows if r["saved_name"])
-        n_fixed = sum(1 for r in rows if self._is_fixed(r))
-        self.count_var.set(f"{len(rows)} readings shown   ({n_saved} led to a saved state, {n_fixed} fixed)   "
-                           f"folder: {self.app.log.dir}")
-
-    def _selected_ids(self) -> list[int]:
-        return [int(i) for i in self.tree.selection()]
-
-    def _on_select(self, _e=None) -> None:
-        ids = self._selected_ids()
-        self._show(self.app.db.reading(ids[0]) if ids else None)
-
-    def _show(self, r) -> None:
-        if r is None:
-            self.preview.configure(image="", text="(select a reading)")
-            self._img = None
-            self.detail_var.set("")
-            self.fix_var.set("")
-            return
-        img = self.app.log.image(r)
-        if img is None:
-            self.preview.configure(image="", text="(image missing)")
-            self._img = None
-        else:
-            im = img.copy()
-            if im.width * 2 <= READING_PREVIEW_MAX[0] and im.height * 2 <= READING_PREVIEW_MAX[1]:
-                im = im.resize((im.width * 2, im.height * 2), Image.NEAREST)  # small crops: show 2x
-            im.thumbnail(READING_PREVIEW_MAX)
-            self._img = ImageTk.PhotoImage(im)
-            self.preview.configure(image=self._img, text="")
-        try:
-            alts = json.loads(r["alternatives"] or "[]")
-        except ValueError:
-            alts = []
-        alt_text = "  |  ".join(f"{t} ({c:.2f})" for t, c in alts) or "-"
-        fixed = f"   fixed {r['fixed_at']}" if r["fixed_name"] else ""
-        self.detail_var.set(f"[{r['engine']}] rows: {alt_text}\nregion {r['region'] or '-'}   {r['image']}{fixed}")
-        self.fix_var.set(r["fixed_name"] or r["read_name"])
-
-    # ----------------------------------------------------------------- actions
-    def confirm_selected(self) -> None:
-        ids = self._selected_ids()
-        for rid in ids:
-            r = self.app.db.reading(rid)
-            if r is not None and r["read_name"]:
-                self.app.db.fix_reading(rid, r["read_name"])
-        self.refresh()
-        if ids:
-            self.app.set_status(f"Marked {len(ids)} reading(s) as read correctly.")
-
-    def fix_selected(self) -> None:
-        ids = self._selected_ids()
-        new = " ".join(self.fix_var.get().split())
-        if not ids:
-            messagebox.showinfo("Fix reading", "Select the reading(s) to fix first.")
-            return
-        if not new:
-            messagebox.showinfo("Fix reading", "Type the correct name first.")
-            return
-        # Records saved under the misread: repair each distinct one once, after asking.
-        wrong_names: list[str] = []
-        for rid in ids:
-            r = self.app.db.reading(rid)
-            if r is not None and r["saved_name"] and r["saved_name"].lower() != new.lower():
-                if r["saved_name"].lower() not in {w.lower() for w in wrong_names}:
-                    wrong_names.append(r["saved_name"])
-        results = []
-        for old in wrong_names:
-            src = self.app.db.get(old, loose=False)
-            if src is None:
-                continue  # already renamed or deleted; nothing left to repair
-            dst = self.app.db.get(new)
-            if dst is not None and dst["id"] != src["id"]:
-                what = (f"'{new}' already has a record ({STATE_LABELS[dst['state']]}, seen {dst['times_seen']}x).\n\n"
-                        f"Merge '{src['name']}' ({STATE_LABELS[src['state']]}, seen {src['times_seen']}x) into it?")
-            else:
-                what = f"Rename the record '{src['name']}' ({STATE_LABELS[src['state']]}, seen {src['times_seen']}x) to '{new}'?"
-            if not messagebox.askyesno("Fix record", what, parent=self):
-                continue
-            try:
-                results.append(self.app.db.rename_record(src["name"], new))
-            except (ValueError, LookupError) as exc:
-                messagebox.showerror("Fix record", str(exc), parent=self)
-        for rid in ids:
-            self.app.db.fix_reading(rid, new)
-        self.refresh()
-        self.app.records.refresh()
-        if results and self.app.home.name_var.get().strip().lower() in {r["old"].lower() for r in results}:
-            self.app.home.set_name(new)
-        done = "; ".join(f"{r['old']} {r['action']} -> {r['name']}" for r in results)
-        self.app.set_status(f"Fixed {len(ids)} reading(s) to '{new}'" + (f".  Records: {done}" if done else "."))
-
-    def load_selected(self) -> None:
-        ids = self._selected_ids()
-        if not ids:
-            return
-        r = self.app.db.reading(ids[0])
-        name = (r["fixed_name"] or r["saved_name"] or r["read_name"]) if r is not None else ""
-        if name:
-            self.app.home.set_name(name)
-            self.app.nb.select(0)
-
-    def delete_selected(self, _e=None) -> None:
-        ids = self._selected_ids()
-        if not ids:
-            return
-        if not messagebox.askyesno("Delete", f"Delete {len(ids)} reading(s) and their images? Records are not touched."):
-            return
-        self.app.log.delete(ids)
-        if self.app.home.reading_id in ids:
-            self.app.home.reading_id = None
-        self.refresh()
-        self.app.set_status(f"Deleted {len(ids)} reading(s).")
-
-    def open_folder(self) -> None:
-        folder = self.app.log.dir
-        folder.mkdir(parents=True, exist_ok=True)
-        try:
-            if sys.platform == "win32":
-                os.startfile(str(folder))  # noqa: S606
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", str(folder)])
-            else:
-                subprocess.Popen(["xdg-open", str(folder)])
-        except OSError as exc:
-            messagebox.showerror("Open folder", str(exc))
 
 
 # ============================================================================ Mini
@@ -1490,6 +1367,9 @@ class MiniWindow(tk.Toplevel):
         small = dict(bg=MINI_BG, fg=MINI_DIM, bd=0, activebackground="#3a3a3a", activeforeground="white")
         tk.Button(bar, text=" X ", command=app._on_close, **small).pack(side="right")
         tk.Button(bar, text=" [ ] ", command=app.exit_mini, **small).pack(side="right")
+        self.undo_btn = tk.Button(bar, text=" undo ", command=app.home.undo_save,
+                                  disabledforeground="#4a4a4a", **small)
+        self.undo_btn.pack(side="right")
 
         self.state_lbl = tk.Label(self, text="", fg=MINI_DIM, bg=MINI_BG, font=("", 10, "bold"), anchor="w")
         self.state_lbl.pack(fill="x", padx=6)
@@ -1518,6 +1398,10 @@ class MiniWindow(tk.Toplevel):
         self.geometry(app.db.get_setting("mini_pos") or "+60+60")
         self.update_idletasks()
         self.lift()
+        self.set_undo(app.home._last_save is not None)
+
+    def set_undo(self, on: bool) -> None:
+        self.undo_btn.configure(state="normal" if on else "disabled")
 
     def set_record(self, rec, name: str, source: str = "local", history: list = ()) -> None:
         self.history.set(history)

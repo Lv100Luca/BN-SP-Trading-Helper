@@ -34,18 +34,21 @@ Python 3.10+ with tkinter (bundled on Windows/macOS; on Linux `sudo apt install 
    adjustable, 0.5-5 s) and fills in the name by itself. It skips OCR while the frame is unchanged and
    only switches to a new name after two consistent reads, so a flickering frame cannot flip it.
    Untick the box to go manual; **READ NAME** / F5 always does a one-off read.
-3. The panel shows the **previous record** for that name (state, times seen, first/last date), or "no previous record".
+3. The panel shows the **previous record** for that name (state, times seen, first/last date) and its
+   **history**: a strip of coloured blocks, one per encounter, oldest left, with the share of each state
+   underneath. Hover a block for its time. Or "no previous record".
 4. Fix the name in the text box if OCR got it slightly wrong (auto-read pauses while you type), then click
-   **TRADING / FIGHTING / AFK / FAKE**. Existing records are overwritten.
-5. **Records** tab: search, filter by state, double-click to load a name into Home, change state or delete.
-   **Export...** saves the listed records as JSON (or CSV for Excel); with a search or filter active only
-   the shown rows are exported. **Import...** merges a JSON (or CSV) export or another `records.sqlite` into
-   your data (newer state wins, no duplicates).
+   **TRADING / FIGHTING / AFK / FAKE**. The state becomes the current one and is added to the history.
+   Misclicked? **Undo last save** takes the encounter back again (also on the mini HUD).
+5. **Records** tab: search, filter by state, double-click to load a name into Home, change the state
+   (a correction, not an encounter), **Rename...** a record whose name OCR got wrong (merges into the
+   right record if one exists) or delete it. **Export...** saves your own records as JSON (or CSV for
+   Excel); with a search or filter active only the matching rows are exported.
 6. **Mini mode** (button in the top row): shrinks the app to a small always-on-top overlay with just the
-   name, its previous state and the four state buttons, so it can sit in front of the game. Drag the text to
-   move it (position is remembered), `[ ]` returns to the full window, `X` quits. Auto-read keeps running.
-   The app reopens in whichever mode you used last. Works with borderless/windowed games; exclusive
-   fullscreen hides every overlay.
+   name, its previous state, the last ten encounters and the four state buttons, so it can sit in front of
+   the game. Drag the text to move it (position is remembered), `undo` takes the last save back, `[ ]`
+   returns to the full window, `X` quits. Auto-read keeps running. The app reopens in whichever mode you
+   used last. Works with borderless/windowed games; exclusive fullscreen hides every overlay.
 
 Tip: keep the app window (or a second monitor) clear of the capture region.
 
@@ -65,40 +68,28 @@ first start of 0.3+, records and settings from the old location (`data/` in the 
 the exe) are merged in and the old file is renamed `records.sqlite.migrated`. Back up the shared
 file to keep your records; `Export...` in the Records tab gives you a JSON copy.
 
-## Global table (shared, read-only)
+## Global table (shared)
 
-Besides your own records the app can consult a shared lookup table hosted on a small server
+Besides your own records the app consults a shared lookup table hosted on a small server
 ([BN-SP-Trading-Helper-API](https://github.com/Lv100Luca/BN-SP-Trading-Helper-API): one Python
-file, deployed to the VPS by its CI). The client downloads the whole table once at
-start-up and whenever you press **Refresh** in the footer, keeps the copy in the local database and
-looks names up offline. A name that is not in your records but is in the table shows up in a blue
-panel marked *global table*; your own records always win. Only the server admin can change the
-table: export your records to `.json` and run `tools/publish_global.py <server url> records.json`.
+file, deployed to the VPS by its CI). The client downloads the whole table at start-up, on
+**Refresh now** in the Settings tab and, with **Auto-download** ticked, every sync interval; it keeps the
+copy in the local database and looks names up offline. A name that is only in the table shows up in a
+blue panel marked *global table*, with the table's history. Which source wins when a name is in both is
+the **Preferred source** setting (default: your own records; the other one is shown as a hint). The
+Records tab lists both (**Source** filter); setting a state on a global row copies it into your records.
 
-The feature is off until `GLOBAL_TABLE_URL` in `app/__init__.py` is set (or the
+**Contributing.** With a contributor key from the table admin (`tools/manage_keys.py <server url>
+create "Name"`, printed once) your saves go into the shared table: paste the key in Settings, **Save
+key** (the app checks it with the server first and only keeps a working one), tick **Upload my saves**.
+Every save, correction, undo and rename is queued and pushed on the sync interval, on **Upload now** and
+when the app closes. On the server each save is one sighting in that name's history; Undo takes your own
+sighting back again, Rename moves your sightings to the right name. You can only ever change what you
+uploaded yourself. A revoked key switches uploads off with a red note in Settings.
+
+The admin can also replace the whole table with an export: `tools/publish_global.py <server url>
+records.json`. The feature is off until `GLOBAL_TABLE_URL` in `app/__init__.py` is set (or the
 `TRADECHECK_GLOBAL_URL` environment variable, for testing).
-
-## Reading log: check and fix misreads (running from source)
-
-When the app runs from source it keeps the capture behind every name it read: the raw grab as a PNG in
-`<data dir>/readings/` plus a row in the `readings` table (engine, text, confidence, the other rows OCR
-saw, region, preprocessing, and later the name and state you saved from it). A third tab, **Readings**,
-lists them newest first with the image of the selected one, so you can see what OCR was looking at.
-
-- **Read was right** marks the selected readings as confirmed.
-- Type the real name in **Correct name** and click **Fix** (or Enter) when OCR got it wrong. The fix is
-  stored on the reading, and if you had saved a state from it under the misread, that record is renamed.
-  If the correct name already has a record, the two are merged (newer state wins, times seen add up)
-  after a confirmation dialog. Multi-select to fix several readings at once.
-- **Load into Home** puts the (fixed) name back in the Home tab; **Delete** removes readings and their
-  images, never records; **Open folder** shows the PNGs.
-- Only the reads that changed the name in the box are logged (every manual read, and the auto-read that
-  switched to a new name), not every frame. Unsaved, unchecked readings are pruned beyond the newest 500;
-  anything you saved a state from or checked is kept.
-
-The log is off in the packaged exe. Set `TRADECHECK_READ_LOG=1` to turn it on there, or `=0` to turn it
-off when running from source. Fixed and confirmed readings double as labelled samples:
-`tools\ocr_tune.py --readings` re-runs OCR over the logged captures and scores it against them.
 
 ## Tuning OCR
 
@@ -154,15 +145,15 @@ run.bat / run.sh    one-click start from source (creates .venv on first run)
 build.py            PyInstaller single-file build; --release packages release/*.zip
 assets/icon.ico     app icon (generated by build.py if missing)
 .github/workflows/  tag-triggered multi-OS release build
-app/db.py           SQLite: records (name, state, times_seen, dates), settings, readings; rename/merge
-app/readings.py     reading log: stores the capture behind each read (source runs), pruning
-app/export.py       JSON (default) / CSV export of records
-app/sync.py         downloads the shared global table (GET /v1/table with ETag)
+app/db.py           SQLite: records, sightings (history), settings, global table copy, upload queue; rename/merge, undo
+app/export.py       JSON (default) / CSV export of records (read_records: the input side, used by publish_global)
+app/sync.py         global table client: download (ETag), contributor key check, push of queued saves
 app/capture.py      mss screen grab + drag-to-select overlay
 app/ocr.py          preprocessing, OCR engines (RapidOCR default, Tesseract optional), name picking
-app/ui.py           tkinter UI (Home, Records and Readings tabs)
-tools/ocr_tune.py   batch OCR over samples/ (or --readings: the logged captures) for tuning
-tools/publish_global.py  upload a records export to the global table server (separate repo)
+app/ui.py           tkinter UI (Home, Records, Settings tabs; mini HUD)
+tools/ocr_tune.py   batch OCR over samples/ for tuning
+tools/publish_global.py  replace the global table with a records export (admin token)
+tools/manage_keys.py     list / create / revoke contributor keys (admin token)
 samples/            drop screenshots here
 data/               legacy DB location (pre-0.3); migrated automatically
 ```

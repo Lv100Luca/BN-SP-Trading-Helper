@@ -70,9 +70,31 @@ def fetch_table(url: str, etag: str = "") -> Fetched:
     return Fetched("updated", new_etag, int(payload.get("version", 0)), str(payload.get("updated_at", "")), records)
 
 
+def check_key(url: str, key: str, timeout: float = TIMEOUT) -> dict:
+    """Blocking GET of <url>/v1/keys/me: {"id", "label"} for a valid contributor key, AuthError for
+    an unknown one. Safe to call from a worker thread."""
+    req = urllib.request.Request(
+        url + "/v1/keys/me",
+        headers={"Accept": "application/json", "Authorization": f"Bearer {key}",
+                 "User-Agent": f"TradeCheck/{__version__}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            raise AuthError("the server does not know this contributor key") from exc
+        raise SyncError(f"server answered {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        raise SyncError(f"could not reach the server ({exc.reason})") from exc
+    except (OSError, ValueError) as exc:
+        raise SyncError(str(exc)) from exc
+
+
 def push_records(url: str, key: str, records: list[dict], timeout: float = TIMEOUT) -> dict:
-    """Blocking POST of saves ({name, state, notes}) with a contributor key. Returns the server's
-    report (added / updated / unchanged / skipped / version). Safe to call from a worker thread."""
+    """Blocking POST of saves ({name, state, notes, ts, kind, new_name}) with a contributor key.
+    Returns the server's report (added / updated / unchanged / retracted / renamed / skipped /
+    version). Safe to call from a worker thread."""
     body = json.dumps({"records": records}, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
         url + "/v1/records", data=body, method="POST",
