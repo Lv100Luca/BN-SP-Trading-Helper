@@ -49,7 +49,8 @@ Python 3.10+ with tkinter (bundled on Windows/macOS; on Linux `sudo apt install 
    to load a name into Home, change the state
    (a correction, not an encounter), **Rename...** a record whose name OCR got wrong (merges into the
    right record if one exists), **Notes...** for a free-text note (also on Home; shown in the panel) or
-   delete it. **Export...** saves your own records as JSON (or CSV for
+   delete it. **Note presets** (Settings tab: a button name and a text each) appear as large buttons in
+   the Notes dialog; one click fills the text in, and you can still type. **Export...** saves your own records as JSON (or CSV for
    Excel); with a search or filter active only the matching rows are exported.
 6. **Mini mode** (button in the top row): shrinks the app to a small always-on-top overlay with just the
    name, its previous state, the last ten encounters and the four state buttons, so it can sit in front of

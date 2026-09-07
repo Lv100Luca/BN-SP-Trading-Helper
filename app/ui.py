@@ -196,6 +196,66 @@ def autowrap(label: tk.Misc, pad: int = 4) -> None:
     label.bind("<Configure>", lambda e: label.configure(wraplength=max(60, e.width - pad)))
 
 
+class NotesDialog(tk.Toplevel):
+    """Modal editor for one record's note. One large button per preset (Settings -> Note presets)
+    puts that preset's text into the box; typing stays possible. ask() returns the new text, or
+    None when cancelled."""
+
+    def __init__(self, parent: tk.Misc, name: str, initial: str, presets: list[dict], hint: str = "") -> None:
+        super().__init__(parent)
+        self.withdraw()
+        self.title("Notes")
+        self.resizable(False, False)
+        self.transient(parent.winfo_toplevel())
+        self.result: str | None = None
+        self.var = tk.StringVar(value=initial)
+        self.preset_btns: list[tk.Button] = []
+        body = ttk.Frame(self, padding=12)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text=f"Notes for {name}:", font=("", 10, "bold")).pack(anchor="w")
+        if hint:
+            ttk.Label(body, text=hint, foreground="#666", justify="left", wraplength=440).pack(anchor="w", pady=(2, 0))
+        if presets:
+            grid = ttk.Frame(body)
+            grid.pack(fill="x", pady=(8, 0))
+            cols = min(3, len(presets))
+            for i, p in enumerate(presets):
+                btn = tk.Button(grid, text=p["name"], font=("", 11, "bold"), height=2, wraplength=140,
+                                command=lambda t=p["text"]: self.var.set(t))
+                btn.grid(row=i // cols, column=i % cols, sticky="ew", padx=3, pady=3)
+                self.preset_btns.append(btn)
+            for c in range(cols):
+                grid.columnconfigure(c, weight=1, uniform="preset")
+        else:
+            ttk.Label(body, text="Tip: Settings -> Note presets adds one-click buttons here.",
+                      foreground="#666").pack(anchor="w", pady=(6, 0))
+        entry = ttk.Entry(body, textvariable=self.var, width=60, font=("", 11))
+        entry.pack(fill="x", pady=(10, 0))
+        btns = ttk.Frame(body)
+        btns.pack(fill="x", pady=(10, 0))
+        ttk.Button(btns, text="Cancel", command=self.destroy).pack(side="right")
+        ttk.Button(btns, text="OK", command=self._ok).pack(side="right", padx=(0, 6))
+        self.bind("<Return>", lambda _e: self._ok())
+        self.bind("<Escape>", lambda _e: self.destroy())
+        self.update_idletasks()
+        top = parent.winfo_toplevel()
+        x = top.winfo_rootx() + (top.winfo_width() - self.winfo_reqwidth()) // 2
+        y = top.winfo_rooty() + (top.winfo_height() - self.winfo_reqheight()) // 3
+        self.geometry(f"+{max(0, x)}+{max(0, y)}")
+        self.deiconify()
+        entry.focus_set()
+        entry.icursor("end")
+
+    def _ok(self) -> None:
+        self.result = self.var.get()
+        self.destroy()
+
+    def ask(self) -> str | None:
+        self.grab_set()
+        self.wait_window()
+        return self.result
+
+
 def fix_dpi() -> None:
     """Make tkinter coordinates match physical pixels on Windows (needed for mss)."""
     if sys.platform != "win32":
@@ -397,9 +457,9 @@ class App(tk.Tk):
             messagebox.showinfo("Notes", f"'{name}' has no record of yours yet. Save a state first.", parent=parent)
             return False
         glob = self.db.get_global(rec["name"])
-        hint = (f"\nGlobal table says: {glob['notes']}" if glob is not None and glob["notes"]
+        hint = (f"Shared note: {glob['notes']}" if glob is not None and glob["notes"]
                 and glob["notes"] != rec["notes"] else "")
-        new = simpledialog.askstring("Notes", f"Notes for {rec['name']}:{hint}", initialvalue=rec["notes"], parent=parent)
+        new = NotesDialog(parent, rec["name"], rec["notes"], self.db.note_presets(), hint).ask()
         if new is None:
             return False
         new = " ".join(new.split())
@@ -1287,8 +1347,8 @@ class RecordsTab(ttk.Frame):
 
 # ======================================================================== Settings
 class SettingsTab(ttk.Frame):
-    """Capture set-up, global table, contributing, About. Content sits in a scrollable canvas so a
-    small window still reaches everything."""
+    """Capture set-up, global table, contributing, note presets, About. Content sits in a scrollable
+    canvas so a small window still reaches everything."""
 
     def __init__(self, master: tk.Misc, app: App) -> None:
         super().__init__(master)
@@ -1332,6 +1392,7 @@ class SettingsTab(ttk.Frame):
             self.refresh_global_label()
             self._build_sync(box)
             self._build_contribute()
+        self._build_presets()
 
         about = ttk.LabelFrame(self.body, text="About", padding=10)
         about.pack(fill="x", pady=(10, 0))
@@ -1394,6 +1455,77 @@ class SettingsTab(ttk.Frame):
         self.discard_btn.pack(side="right", padx=(0, 6))
         self._rejected = False   # the server answered 401 to an upload this session
         self.refresh_pending_label()
+
+    def _build_presets(self) -> None:
+        box = ttk.LabelFrame(self.body, text="Note presets", padding=10)
+        box.pack(fill="x", pady=(10, 0))
+        hint = ttk.Label(box, text="Each preset is a large button in the Notes dialog; one click puts its text into "
+                                   "the note (you can still type). Select a row to edit it.",
+                         foreground="#666", justify="left")
+        hint.pack(fill="x")
+        autowrap(hint)
+        self.preset_tree = ttk.Treeview(box, columns=("name", "text"), show="headings", height=4, selectmode="browse")
+        self.preset_tree.heading("name", text="Button")
+        self.preset_tree.heading("text", text="Note text")
+        self.preset_tree.column("name", width=140, stretch=False)
+        self.preset_tree.column("text", width=320, stretch=True)
+        self.preset_tree.pack(fill="x", pady=(6, 0))
+        self.preset_tree.bind("<<TreeviewSelect>>", lambda _e: self._preset_pick())
+        row = ttk.Frame(box)
+        row.pack(fill="x", pady=(6, 0))
+        self.preset_name = tk.StringVar()
+        self.preset_text = tk.StringVar()
+        ttk.Label(row, text="Button:").pack(side="left")
+        ttk.Entry(row, textvariable=self.preset_name, width=16).pack(side="left", padx=(4, 10))
+        ttk.Label(row, text="Text:").pack(side="left")
+        ttk.Entry(row, textvariable=self.preset_text).pack(side="left", fill="x", expand=True, padx=(4, 10))
+        ttk.Button(row, text="Remove", command=self._preset_remove).pack(side="right")
+        ttk.Button(row, text="Add / Update", command=self._preset_save).pack(side="right", padx=(0, 6))
+        self._refresh_presets()
+
+    def _refresh_presets(self) -> None:
+        self.preset_tree.delete(*self.preset_tree.get_children())
+        for i, p in enumerate(self.app.db.note_presets()):
+            self.preset_tree.insert("", "end", iid=str(i), values=(p["name"], p["text"]))
+
+    def _preset_pick(self) -> None:
+        sel = self.preset_tree.selection()
+        if sel:
+            name, text = self.preset_tree.item(sel[0], "values")
+            self.preset_name.set(name)
+            self.preset_text.set(text)
+
+    def _preset_save(self) -> None:
+        """Add / Update: the selected row is replaced (so a button can be renamed); with nothing
+        selected, a preset of the same name is updated, otherwise a new one is appended."""
+        name = " ".join(self.preset_name.get().split())
+        text = " ".join(self.preset_text.get().split())
+        if not name or not text:
+            messagebox.showinfo("Note presets", "A preset needs a button name and a note text.", parent=self)
+            return
+        presets = self.app.db.note_presets()
+        sel = self.preset_tree.selection()
+        idx = int(sel[0]) if sel else next((i for i, p in enumerate(presets) if p["name"].lower() == name.lower()), None)
+        if idx is None:
+            presets.append({"name": name, "text": text})
+        else:
+            presets[idx] = {"name": name, "text": text}
+        self.app.db.set_note_presets(presets)
+        self._refresh_presets()
+        self.preset_name.set("")
+        self.preset_text.set("")
+        self.app.set_status(f"Note preset '{name}' saved.")
+
+    def _preset_remove(self) -> None:
+        sel = self.preset_tree.selection()
+        if not sel:
+            return
+        presets = self.app.db.note_presets()
+        del presets[int(sel[0])]
+        self.app.db.set_note_presets(presets)
+        self._refresh_presets()
+        self.preset_name.set("")
+        self.preset_text.set("")
 
     def _set_interval(self) -> None:
         try:

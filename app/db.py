@@ -605,3 +605,16 @@ class Database:
             (key, str(value)),
         )
         self.conn.commit()
+
+    # ------------------------------------------------------------- note presets
+    def note_presets(self) -> list[dict]:
+        """[{"name", "text"}, ...] as set up in Settings, in button order for the Notes dialog."""
+        try:
+            raw = json.loads(self.get_setting("note_presets", "[]") or "[]")
+        except ValueError:
+            raw = []
+        return [{"name": str(p.get("name", "")), "text": str(p.get("text", ""))}
+                for p in raw if isinstance(p, dict) and p.get("name") and p.get("text")]
+
+    def set_note_presets(self, presets: list[dict]) -> None:
+        self.set_setting("note_presets", json.dumps(presets, ensure_ascii=False))
