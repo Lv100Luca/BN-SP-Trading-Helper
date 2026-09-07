@@ -25,6 +25,7 @@ STATE_FG = {"trading": "white", "fighting": "white", "afk": "white", "fake": "#2
 STATE_PALE = {"trading": "#e8f5e9", "fighting": "#ffebee", "afk": "#eeeeee", "fake": "#fff8e1"}
 GLOBAL_PALE = "#e3f2fd"   # previous-record panel when the state comes from the shared table
 PREVIEW_MAX = (520, 140)
+DEFAULT_SIZE = (760, 660)   # first start; afterwards the last window size is restored
 SAVE_COOLDOWN = 15   # seconds the double click guard ignores clicks for the same name (packaged app)
 
 
@@ -139,6 +140,11 @@ def history_summary(rows: list) -> str:
     return "  |  ".join(f"{st} {round(100 * n / total)}%" for st, n in ranked)
 
 
+def autowrap(label: tk.Misc, pad: int = 4) -> None:
+    """Wrap a packed (fill=x) label at its own width, so long text never widens the window."""
+    label.bind("<Configure>", lambda e: label.configure(wraplength=max(60, e.width - pad)))
+
+
 def fix_dpi() -> None:
     """Make tkinter coordinates match physical pixels on Windows (needed for mss)."""
     if sys.platform != "win32":
@@ -158,7 +164,7 @@ class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(f"Trade Check v{__version__}")
-        self.minsize(660, 600)
+        self.minsize(640, 520)
         try:
             self.tk.call("tk", "scaling", self.winfo_fpixels("1i") / 72.0)
         except tk.TclError:
@@ -191,6 +197,7 @@ class App(tk.Tk):
         self.nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
         self.bind("<F5>", lambda _e: self.home.read_name())
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._restore_geometry()
         self.mini: MiniWindow | None = None
         if self.db.get_setting("mini_mode") == "1":
             self.after(200, self.enter_mini)
@@ -203,6 +210,14 @@ class App(tk.Tk):
         if sync.table_url():
             self.after(1500, self.refresh_global)  # let the window come up first
             self.after(30_000, self._sync_tick)
+
+    def _restore_geometry(self) -> None:
+        """Last window size and position, or the default size (the content wraps to fit)."""
+        saved = self.db.get_setting("win_geometry") or ""
+        if re.fullmatch(r"\d+x\d+([+-]\d+[+-]\d+)?", saved):
+            self.geometry(saved)
+            return
+        self.geometry("%dx%d" % DEFAULT_SIZE)
 
     def _build_footer(self) -> None:
         """Last action on the left, version on the right. Everything else lives in the Settings tab."""
@@ -472,6 +487,8 @@ class App(tk.Tk):
 
     def _on_close(self) -> None:
         self.home.stop_auto()
+        if self.winfo_viewable():
+            self.db.set_setting("win_geometry", self.geometry())
         self._flush_on_exit()
         self.db.close()
         self.destroy()
@@ -554,10 +571,12 @@ class HomeTab(ttk.Frame):
         self.prev_history_lbl.pack(side="right", anchor="s")
         self.prev_detail = tk.Label(self.prev_frame, text="", justify="left", anchor="w")
         self.prev_detail.pack(fill="x")
+        autowrap(self.prev_detail)
         self.prev_history = HistoryBar(self.prev_frame)
         self.prev_history.pack(fill="x", pady=(6, 0))
-        self.prev_notes = tk.Label(self.prev_frame, text="", justify="left", anchor="w", wraplength=600)
+        self.prev_notes = tk.Label(self.prev_frame, text="", justify="left", anchor="w")
         self.prev_notes.pack(fill="x")
+        autowrap(self.prev_notes)
 
         ttk.Label(self, text="Record the current state (added to this player's history):").pack(anchor="w", pady=(8, 2))
         row = ttk.Frame(self)
@@ -575,8 +594,9 @@ class HomeTab(ttk.Frame):
         # fixed button width and a wrapping label, so the countdown never changes the window width
         self.undo_btn = ttk.Button(row, text="Undo last save", command=self.undo_save, state="disabled", width=30)
         self.undo_btn.pack(side="right")
-        ttk.Label(row, textvariable=self.cooldown_var, foreground="#666", wraplength=300, justify="left"
-                  ).pack(side="left", fill="x", expand=True)
+        cd = ttk.Label(row, textvariable=self.cooldown_var, foreground="#666", justify="left")
+        cd.pack(side="left", fill="x", expand=True)
+        autowrap(cd)
         ttk.Button(row, text="Notes...", command=self.edit_notes).pack(side="right", padx=(0, 6))
 
     def note_typing(self) -> None:
@@ -598,9 +618,11 @@ class HomeTab(ttk.Frame):
         ttk.Label(row, textvariable=self.region_var).pack(side="left")
         ttk.Button(row, text="Test capture", command=self.test_capture).pack(side="right")
         ttk.Button(row, text="Select region...", command=self.select_region).pack(side="right", padx=(0, 6))
-        ttk.Label(parent, text="Drag a box over where the enemy name appears; leave a little space around it and "
-                          "stop above the level line. The preview shows exactly what is captured.",
-                  foreground="#666", wraplength=720, justify="left").pack(anchor="w", pady=(2, 8))
+        hint = ttk.Label(parent, text="Drag a box over where the enemy name appears; leave a little space around it "
+                                      "and stop above the level line. The preview shows exactly what is captured.",
+                         foreground="#666", justify="left")
+        hint.pack(fill="x", pady=(2, 8))
+        autowrap(hint)
 
         auto = ttk.Frame(parent)
         auto.pack(fill="x", pady=(0, 8))
@@ -612,9 +634,9 @@ class HomeTab(ttk.Frame):
 
         self.preview = ttk.Label(parent, anchor="center", relief="groove", text="(capture preview)")
         self.preview.pack(fill="x", ipady=6)
-        ttk.Label(parent, textvariable=self.ocr_info, foreground="#666", wraplength=720, justify="left").pack(
-            anchor="w", pady=(2, 0)
-        )
+        info = ttk.Label(parent, textvariable=self.ocr_info, foreground="#666", justify="left")
+        info.pack(fill="x", pady=(2, 0))
+        autowrap(info)
 
     # ------------------------------------------------------------------ region
     def _refresh_region_label(self) -> None:
@@ -1231,22 +1253,39 @@ class RecordsTab(ttk.Frame):
 
 # ======================================================================== Settings
 class SettingsTab(ttk.Frame):
-    """Global table (preferred source, refresh) and About."""
+    """Capture set-up, global table, contributing, About. Content sits in a scrollable canvas so a
+    small window still reaches everything."""
 
     def __init__(self, master: tk.Misc, app: App) -> None:
-        super().__init__(master, padding=10)
+        super().__init__(master)
         self.app = app
         self.global_var: tk.StringVar | None = None
         self.global_btn: ttk.Button | None = None
+        canvas = tk.Canvas(self, highlightthickness=0, bd=0, bg=app.cget("bg"))
+        sb = ttk.Scrollbar(self, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        self.body = ttk.Frame(canvas, padding=10)
+        win = canvas.create_window((0, 0), window=self.body, anchor="nw")
+        self.body.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(win, width=e.width))
+
+        def wheel(e: tk.Event) -> None:
+            if canvas.bbox("all") and canvas.bbox("all")[3] > canvas.winfo_height():
+                canvas.yview_scroll(-1 if e.delta > 0 else 1, "units")
+
+        canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", wheel))
+        canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
         self._build()
 
     def _build(self) -> None:
-        cap = ttk.LabelFrame(self, text="Capture", padding=10)
+        cap = ttk.LabelFrame(self.body, text="Capture", padding=10)
         cap.pack(fill="x")
         self.app.home.build_capture_controls(cap)
 
         if sync.table_url():
-            box = ttk.LabelFrame(self, text="Global table", padding=10)
+            box = ttk.LabelFrame(self.body, text="Global table", padding=10)
             box.pack(fill="x", pady=(10, 0))
             row = ttk.Frame(box)
             row.pack(fill="x")
@@ -1270,7 +1309,7 @@ class SettingsTab(ttk.Frame):
             self._build_sync(box)
             self._build_contribute()
 
-        about = ttk.LabelFrame(self, text="About", padding=10)
+        about = ttk.LabelFrame(self.body, text="About", padding=10)
         about.pack(fill="x", pady=(10, 0))
         ttk.Label(about, text=f"Trade Check v{__version__}").pack(anchor="w")
         link = ttk.Label(about, text=REPO_URL, foreground="#1565c0", cursor="hand2", font=("", 9, "underline"))
@@ -1297,11 +1336,13 @@ class SettingsTab(ttk.Frame):
 
     def _build_contribute(self) -> None:
         db = self.app.db
-        box = ttk.LabelFrame(self, text="Contribute to the global table", padding=10)
+        box = ttk.LabelFrame(self.body, text="Contribute to the global table", padding=10)
         box.pack(fill="x", pady=(10, 0))
-        ttk.Label(box, text="With a contributor key from the table admin your saves are uploaded and "
-                            "merged into the shared table on the sync interval (and when the app closes).",
-                  foreground="#666", wraplength=720, justify="left").pack(anchor="w")
+        hint = ttk.Label(box, text="With a contributor key from the table admin your saves are uploaded and "
+                                   "merged into the shared table on the sync interval (and when the app closes).",
+                         foreground="#666", justify="left")
+        hint.pack(fill="x")
+        autowrap(hint)
         row = ttk.Frame(box)
         row.pack(fill="x", pady=(8, 0))
         ttk.Label(row, text="Contributor key:").pack(side="left")
