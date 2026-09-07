@@ -24,7 +24,7 @@ STATE_FG = {"trading": "white", "fighting": "white", "afk": "white", "fake": "#2
 STATE_PALE = {"trading": "#e8f5e9", "fighting": "#ffebee", "afk": "#eeeeee", "fake": "#fff8e1"}
 GLOBAL_PALE = "#e3f2fd"   # previous-record panel when the state comes from the shared table
 PREVIEW_MAX = (520, 140)
-SAVE_COOLDOWN = 15.0   # seconds: clicks for the same name are ignored (double click guard); Undo still works
+SAVE_COOLDOWN = 15   # default seconds the double click guard ignores clicks for the same name (Settings)
 
 
 def _fingerprint(img: Image.Image) -> np.ndarray:
@@ -286,6 +286,13 @@ class App(tk.Tk):
             return min(15, max(1, int(self.db.get_setting("sync_interval", "5") or 5)))
         except ValueError:
             return 5
+
+    def save_cooldown(self) -> int:
+        """Seconds the double click guard ignores clicks for the same name (0 = off)."""
+        try:
+            return min(300, max(0, int(self.db.get_setting("save_cooldown", str(SAVE_COOLDOWN)) or SAVE_COOLDOWN)))
+        except ValueError:
+            return SAVE_COOLDOWN
 
     def sharing(self) -> bool:
         return self.db.get_setting("share_uploads") == "1" and bool(self.db.get_setting("contrib_key"))
@@ -874,8 +881,9 @@ class HomeTab(ttk.Frame):
             return
         ls = self._last_save
         if ls is not None and name_key(ls["name"]) == name_key(name) and self._cooldown_left() > 0:
-            self.app.set_status(f"{ls['name']} was saved as {STATE_LABELS[ls['state']]} {SAVE_COOLDOWN - self._cooldown_left():.0f} s ago; "
-                                f"a new encounter counts in {self._cooldown_left():.0f} s. Misclick? Undo it.")
+            self.app.set_status(f"{ls['name']} was saved as {STATE_LABELS[ls['state']]} "
+                                f"{self.app.save_cooldown() - self._cooldown_left():.0f} s ago; a new encounter "
+                                f"counts in {self._cooldown_left():.0f} s. Misclick? Undo it.")
             return
         prev = self.app.db.get(name)
         rec = self.app.db.upsert(name, state)
@@ -897,7 +905,7 @@ class HomeTab(ttk.Frame):
 
     def _cooldown_left(self) -> float:
         ls = self._last_save
-        return max(0.0, SAVE_COOLDOWN - (time.monotonic() - ls["at"])) if ls else 0.0
+        return max(0.0, self.app.save_cooldown() - (time.monotonic() - ls["at"])) if ls else 0.0
 
     def _tick_cooldown(self) -> None:
         left = self._cooldown_left()
@@ -1234,6 +1242,20 @@ class SettingsTab(ttk.Frame):
             self._build_sync(box)
             self._build_contribute()
 
+        saving = ttk.LabelFrame(self, text="Saving", padding=10)
+        saving.pack(fill="x", pady=(10, 0))
+        row = ttk.Frame(saving)
+        row.pack(fill="x")
+        ttk.Label(row, text="Double click guard:").pack(side="left")
+        self.cooldown_var = tk.IntVar(value=self.app.save_cooldown())
+        spin = ttk.Spinbox(row, from_=0, to=300, increment=5, width=5, textvariable=self.cooldown_var,
+                           command=self._set_cooldown)
+        spin.pack(side="left", padx=(6, 4))
+        spin.bind("<FocusOut>", lambda _e: self._set_cooldown())
+        spin.bind("<Return>", lambda _e: self._set_cooldown())
+        ttk.Label(row, text="s  (clicks for the same name are ignored this long after a save; 0 = off)",
+                  foreground="#666").pack(side="left")
+
         about = ttk.LabelFrame(self, text="About", padding=10)
         about.pack(fill="x", pady=(10, 0))
         ttk.Label(about, text=f"Trade Check v{__version__}").pack(anchor="w")
@@ -1293,6 +1315,14 @@ class SettingsTab(ttk.Frame):
         self.discard_btn.pack(side="right", padx=(0, 6))
         self._rejected = False   # the server answered 401 to an upload this session
         self.refresh_pending_label()
+
+    def _set_cooldown(self) -> None:
+        try:
+            secs = min(300, max(0, int(self.cooldown_var.get())))
+        except (tk.TclError, ValueError):
+            secs = SAVE_COOLDOWN
+        self.cooldown_var.set(secs)
+        self.app.db.set_setting("save_cooldown", str(secs))
 
     def _set_interval(self) -> None:
         try:
