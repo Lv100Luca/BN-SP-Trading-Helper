@@ -86,7 +86,9 @@ CREATE TABLE IF NOT EXISTS global_records (   -- read-only copy of the shared ta
     name_key   TEXT NOT NULL,
     state      TEXT NOT NULL,
     notes      TEXT NOT NULL DEFAULT '',
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    times_seen INTEGER NOT NULL DEFAULT 0,
+    history    TEXT NOT NULL DEFAULT '[]'     -- JSON [[state, ts, kind], ...] oldest first
 );
 CREATE INDEX IF NOT EXISTS idx_global_key ON global_records(name_key);
 CREATE TABLE IF NOT EXISTS sightings (        -- state timeline per record, oldest first by ts
@@ -102,7 +104,8 @@ CREATE TABLE IF NOT EXISTS pending_uploads (  -- saves waiting to be pushed to t
     name  TEXT NOT NULL,
     state TEXT NOT NULL,
     notes TEXT NOT NULL DEFAULT '',
-    ts    TEXT NOT NULL
+    ts    TEXT NOT NULL,
+    kind  TEXT NOT NULL DEFAULT 'seen'
 );
 """
 
@@ -169,6 +172,14 @@ class Database:
         if "name_key" not in cols:
             self.conn.execute("ALTER TABLE records ADD COLUMN name_key TEXT NOT NULL DEFAULT ''")
             self.conn.commit()
+        for table, column, ddl in (
+            ("global_records", "times_seen", "INTEGER NOT NULL DEFAULT 0"),
+            ("global_records", "history", "TEXT NOT NULL DEFAULT '[]'"),
+            ("pending_uploads", "kind", "TEXT NOT NULL DEFAULT 'seen'"),
+        ):
+            if column not in {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")}:
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+                self.conn.commit()
         row = self.conn.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'records'"
         ).fetchone()
@@ -312,7 +323,7 @@ class Database:
     # Every row carries a `source` column. Global rows have no encounter count (times_seen = 0)
     # and no first-seen time (created_at = updated_at), so exports and the list treat them alike.
     _LOCAL_SQL = "SELECT id, name, state, notes, times_seen, created_at, updated_at, 'local' AS source FROM records"
-    _GLOBAL_SQL = ("SELECT NULL AS id, name, state, notes, 0 AS times_seen, updated_at AS created_at, updated_at, "
+    _GLOBAL_SQL = ("SELECT NULL AS id, name, state, notes, times_seen, updated_at AS created_at, updated_at, "
                    "'global' AS source FROM global_records")
     SOURCES = ("both", "local", "global")
 
@@ -467,12 +478,20 @@ class Database:
         for r in records:
             name = normalize_name(str(r.get("name", "")))
             state = str(r.get("state", "")).lower()
-            if name and state in STATES:
-                rows.append((name, name_key(name), state, str(r.get("notes") or ""), str(r.get("updated_at") or "")))
+            if not name or state not in STATES:
+                continue
+            try:
+                seen = max(0, int(r.get("times_seen") or 0))
+            except (TypeError, ValueError):
+                seen = 0
+            history = [h for h in (r.get("history") or []) if isinstance(h, list) and len(h) >= 2 and h[0] in STATES]
+            rows.append((name, name_key(name), state, str(r.get("notes") or ""), str(r.get("updated_at") or ""),
+                         seen, json.dumps(history)))
         with self.conn:  # one transaction: readers never see an empty table
             self.conn.execute("DELETE FROM global_records")
             self.conn.executemany(
-                "INSERT OR REPLACE INTO global_records (name, name_key, state, notes, updated_at) VALUES (?, ?, ?, ?, ?)",
+                "INSERT OR REPLACE INTO global_records (name, name_key, state, notes, updated_at, times_seen, history)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
                 rows,
             )
             for key, value in (("global_version", version), ("global_updated_at", updated_at),
@@ -483,12 +502,24 @@ class Database:
                 )
         return len(rows)
 
+    def global_history(self, name: str) -> list[dict]:
+        """Timeline of the shared table's entry for `name`, oldest first, as {state, ts, kind} dicts."""
+        rec = self.get_global(name)
+        if rec is None:
+            return []
+        try:
+            raw = json.loads(rec["history"] or "[]")
+        except ValueError:
+            return []
+        return [{"state": h[0], "ts": str(h[1]).replace("T", " ").rstrip("Z"), "kind": (h[2] if len(h) > 2 else "seen")}
+                for h in raw if isinstance(h, list) and len(h) >= 2 and h[0] in STATES]
+
     # Contributors (Settings tab: key + "upload my saves") queue every save here; App flushes the
-    # queue to the server on the sync interval and on exit.
-    def queue_upload(self, name: str, state: str, notes: str = "") -> None:
+    # queue to the server on the sync interval and on exit. kind: "seen" (an encounter) or "edit".
+    def queue_upload(self, name: str, state: str, notes: str = "", kind: str = "seen") -> None:
         self.conn.execute(
-            "INSERT INTO pending_uploads (name, state, notes, ts) VALUES (?, ?, ?, ?)",
-            (normalize_name(name), state, notes or "", _now()),
+            "INSERT INTO pending_uploads (name, state, notes, ts, kind) VALUES (?, ?, ?, ?, ?)",
+            (normalize_name(name), state, notes or "", _now(), kind),
         )
         self.conn.commit()
 

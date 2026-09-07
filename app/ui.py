@@ -292,10 +292,11 @@ class App(tk.Tk):
     def sharing(self) -> bool:
         return self.db.get_setting("share_uploads") == "1" and bool(self.db.get_setting("contrib_key"))
 
-    def record_saved(self, name: str, state: str, notes: str = "") -> None:
-        """Called after every state save; queues it for the global table when sharing is on."""
+    def record_saved(self, name: str, state: str, notes: str = "", kind: str = "seen") -> None:
+        """Called after every state save; queues it for the global table when sharing is on.
+        kind "seen" is an encounter (Home), "edit" a correction (Records tab)."""
         if self.sharing():
-            self.db.queue_upload(name, state, notes)
+            self.db.queue_upload(name, state, notes, kind)
             self.settings.refresh_pending_label()
 
     def _sync_tick(self) -> None:
@@ -322,7 +323,8 @@ class App(tk.Tk):
         self._push_busy = True
         self.settings.set_upload_enabled(False)
         ids = [r["id"] for r in rows]
-        records = [{"name": r["name"], "state": r["state"], "notes": r["notes"]} for r in rows]
+        records = [{"name": r["name"], "state": r["state"], "notes": r["notes"], "ts": r["ts"], "kind": r["kind"]}
+                   for r in rows]
 
         def work() -> None:  # no tkinter or sqlite calls in here
             try:
@@ -342,8 +344,8 @@ class App(tk.Tk):
             return
         try:
             sync.push_records(sync.table_url(), self.db.get_setting("contrib_key", "") or "",
-                              [{"name": r["name"], "state": r["state"], "notes": r["notes"]} for r in rows],
-                              timeout=4)
+                              [{"name": r["name"], "state": r["state"], "notes": r["notes"], "ts": r["ts"],
+                                "kind": r["kind"]} for r in rows], timeout=4)
             self.db.clear_uploads(r["id"] for r in rows)
         except Exception:  # noqa: BLE001  - stays queued for the next run
             pass
@@ -750,8 +752,7 @@ class HomeTab(ttk.Frame):
         """`other` is the record from the source that did not win (shown as a hint), if any."""
         self.current_record = rec
         self.current_source = source if rec is not None else ""
-        own = rec if (rec is not None and source == "local") else other
-        rows = self._show_history(own["name"] if own is not None else "")
+        rows = self._show_history(rec, source, other)
         self.app.update_mini(rec, name, self.current_source, rows)
         if not name:
             self._paint_prev("No name read yet", "", bg=None, fg="black")
@@ -776,13 +777,21 @@ class HomeTab(ttk.Frame):
                 bg=STATE_PALE[st], fg=STATE_COLORS[st],
             )
 
-    def _show_history(self, name: str) -> list:
-        rows = self.app.db.history(name) if name else []
+    def _show_history(self, rec, source: str, other=None) -> list:
+        """Timeline of the record that won the lookup; the other source's when the winner has none."""
+        rows, where = [], ""
+        for r, src in ((rec, source), (other, "global" if source == "local" else "local")):
+            if r is None:
+                continue
+            rows = self.app.db.history(r["name"]) if src == "local" else self.app.db.global_history(r["name"])
+            where = "" if src == "local" else " (global table)"
+            if rows:
+                break
         self.prev_history.set(rows)
         if len(rows) > 1:
-            self.prev_history_lbl.configure(text=f"History ({len(rows)}): {history_summary(rows)}")
+            self.prev_history_lbl.configure(text=f"History{where} ({len(rows)}): {history_summary(rows)}")
         elif rows:
-            self.prev_history_lbl.configure(text="History: only this one sighting")
+            self.prev_history_lbl.configure(text=f"History{where}: only this one sighting")
         else:
             self.prev_history_lbl.configure(text="")
         return rows
@@ -906,7 +915,7 @@ class RecordsTab(ttk.Frame):
         selected = set(self.tree.selection())
         self.tree.delete(*self.tree.get_children())
         for r in rows:
-            seen = r["times_seen"] if r["source"] == "local" else "-"
+            seen = r["times_seen"] or "-"
             self.tree.insert(
                 "", "end", iid=self._iid(r["source"], r["name"]),
                 values=(r["name"], STATE_LABELS[r["state"]], r["source"], seen, r["updated_at"]),
@@ -933,13 +942,13 @@ class RecordsTab(ttk.Frame):
             self.history_bar.set([])
             return
         name, source = picked[0]
-        rows = self.app.db.history(name)
+        rows = self.app.db.history(name) if source == "local" else self.app.db.global_history(name)
         self.history_bar.set(rows)
+        where = "" if source == "local" else " in the global table"
         if not rows:
-            why = " (global table entries have no history)" if source == "global" else ""
-            self.history_lbl.configure(text=f"History of {name}: none{why}")
+            self.history_lbl.configure(text=f"History of {name}{where}: none")
         else:
-            self.history_lbl.configure(text=f"History of {name} ({len(rows)}): {history_summary(rows)}")
+            self.history_lbl.configure(text=f"History of {name}{where} ({len(rows)}): {history_summary(rows)}")
 
     def _current_rows(self):
         q = self.search_var.get().strip()
@@ -1014,7 +1023,7 @@ class RecordsTab(ttk.Frame):
                 self.app.db.upsert(name, state, glob["notes"] if glob is not None else None)
                 adopted += 1
             rec = self.app.db.get(name)
-            self.app.record_saved(name, state, rec["notes"] if rec is not None else "")
+            self.app.record_saved(name, state, rec["notes"] if rec is not None else "", kind="edit")
         self.refresh()
         if picked:
             extra = f" ({adopted} copied from the global table into your records)" if adopted else ""
