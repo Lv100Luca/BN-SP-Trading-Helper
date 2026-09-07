@@ -48,8 +48,7 @@ Python 3.10+ with tkinter (bundled on Windows/macOS; on Linux `sudo apt install 
    Excel); with a search or filter active only the matching rows are exported.
 6. **Mini mode** (button in the top row): shrinks the app to a small always-on-top overlay with just the
    name, its previous state, the last ten encounters and the four state buttons, so it can sit in front of
-   the game. The name is editable there too (Enter looks it up). Drag the state line to move it
-   (position is remembered), `undo` takes the last save back, `[ ]`
+   the game. Drag the text to move it (position is remembered), `undo` takes the last save back, `[ ]`
    returns to the full window, `X` quits. Auto-read keeps running. The app reopens in whichever mode you
    used last. Works with borderless/windowed games; exclusive fullscreen hides every overlay.
 

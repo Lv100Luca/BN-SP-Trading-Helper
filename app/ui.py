@@ -1470,13 +1470,9 @@ class MiniWindow(tk.Toplevel):
 
         bar = tk.Frame(self, bg=MINI_BG)
         bar.pack(fill="x", padx=6, pady=(4, 0))
-        # Editable: fix a misread right on the HUD, Enter looks the name up. Typing pauses auto-read.
-        self.name_entry = tk.Entry(bar, textvariable=app.home.name_var, fg=MINI_FG, bg=MINI_BG,
-                                   insertbackground=MINI_FG, font=("", 12, "bold"), bd=0,
-                                   highlightthickness=0, relief="flat")
-        self.name_entry.pack(side="left", fill="x", expand=True)
-        self.name_entry.bind("<Return>", lambda _e: app.home.lookup())
-        self.name_entry.bind("<Key>", lambda _e: app.home.note_typing())
+        self.name_lbl = tk.Label(bar, textvariable=app.home.name_var, fg=MINI_FG, bg=MINI_BG,
+                                 font=("", 12, "bold"), anchor="w")
+        self.name_lbl.pack(side="left", fill="x", expand=True)
         small = dict(bg=MINI_BG, fg=MINI_DIM, bd=0, activebackground="#3a3a3a", activeforeground="white")
         tk.Button(bar, text=" X ", command=app._on_close, **small).pack(side="right")
         tk.Button(bar, text=" [ ] ", command=app.exit_mini, **small).pack(side="right")
@@ -1504,7 +1500,7 @@ class MiniWindow(tk.Toplevel):
         foot = tk.Label(self, textvariable=app.home.auto_status, fg="#777777", bg=MINI_BG, font=("", 7), anchor="w")
         foot.pack(fill="x", padx=6, pady=(0, 3))
 
-        for w in (bar, self.state_lbl, self.note_lbl, self.history, btns, foot):  # not the buttons or the name box
+        for w in (bar, self.name_lbl, self.state_lbl, self.note_lbl, self.history, btns, foot):  # not the buttons
             w.bind("<ButtonPress-1>", self._drag_start)
             w.bind("<B1-Motion>", self._drag_move)
             w.bind("<ButtonRelease-1>", self._drag_end)
