@@ -179,6 +179,7 @@ class App(tk.Tk):
                 f"Moved records to the shared database ({self.db.path}): {r['added']} added, "
                 f"{r['updated']} updated from {r['source']}"
             )
+        self._build_footer()   # packed first so a shrinking window squeezes the tabs, not the footer
         self.nb = ttk.Notebook(self)
         self.nb.pack(fill="both", expand=True, padx=6, pady=(6, 0))
         self.home = HomeTab(self.nb, self)
@@ -188,7 +189,6 @@ class App(tk.Tk):
         self.settings = SettingsTab(self.nb, self)
         self.nb.add(self.settings, text="   Settings   ")
         self.nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
-        self._build_footer()
         self.bind("<F5>", lambda _e: self.home.read_name())
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.mini: MiniWindow | None = None
