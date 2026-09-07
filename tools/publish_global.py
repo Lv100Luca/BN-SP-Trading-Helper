@@ -6,6 +6,9 @@
 
 Accepts the same files the app's Import understands (.json, .csv or a records.sqlite). The
 upload replaces the server table with the file's contents.
+
+The admin token is read, in order: --token, TRADECHECK_ADMIN_TOKEN env var, the .admin_token
+file in the project root (gitignored; put the token in it once for easy reuse).
 """
 from __future__ import annotations
 
@@ -17,7 +20,10 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+TOKEN_FILE = PROJECT_ROOT / ".admin_token"
+
+sys.path.insert(0, str(PROJECT_ROOT))
 from app.export import read_records  # noqa: E402
 
 
@@ -26,10 +32,13 @@ def main() -> int:
     ap.add_argument("url", help="server base URL, e.g. https://table.example.com")
     ap.add_argument("file", help="records export (.json / .csv / .sqlite)")
     ap.add_argument("--token", default=os.environ.get("TRADECHECK_ADMIN_TOKEN", ""),
-                    help="admin token (default: TRADECHECK_ADMIN_TOKEN env var)")
+                    help="admin token (default: TRADECHECK_ADMIN_TOKEN env var, then .admin_token)")
     args = ap.parse_args()
+    if not args.token and TOKEN_FILE.exists():
+        args.token = TOKEN_FILE.read_text(encoding="utf-8").strip()
     if not args.token:
-        print("no admin token: pass --token or set TRADECHECK_ADMIN_TOKEN", file=sys.stderr)
+        print("no admin token: pass --token, set TRADECHECK_ADMIN_TOKEN, or put it in .admin_token",
+              file=sys.stderr)
         return 2
 
     records = read_records(args.file)
