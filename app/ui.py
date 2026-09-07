@@ -193,6 +193,8 @@ class App(tk.Tk):
         if self.log is not None:
             self.readings_tab = ReadingsTab(self.nb, self)
             self.nb.add(self.readings_tab, text="   Readings   ")
+        self.settings = SettingsTab(self.nb, self)
+        self.nb.add(self.settings, text="   Settings   ")
         self.nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
         self._build_footer()
         self.bind("<F5>", lambda _e: self.home.read_name())
@@ -207,47 +209,15 @@ class App(tk.Tk):
             self.after(1500, self.refresh_global)  # let the window come up first
 
     def _build_footer(self) -> None:
-        """Status text on the left; a small About section (version + GitHub link) on the right."""
+        """Last action on the left, version on the right. Everything else lives in the Settings tab."""
         footer = ttk.Frame(self, relief="sunken", padding=(6, 3))
         footer.pack(fill="x", side="bottom")
-        about = ttk.Frame(footer)
-        about.pack(side="right", padx=(12, 0))
-        ttk.Label(about, text=f"Trade Check v{__version__}  ·", foreground="#666").pack(side="left")
-        link = ttk.Label(about, text="GitHub", foreground="#1565c0", cursor="hand2", font=("", 9, "underline"))
-        link.pack(side="left", padx=(4, 0))
-        link.bind("<Button-1>", lambda _e: webbrowser.open(REPO_URL))
-        self.global_var: tk.StringVar | None = None
-        self.global_btn: ttk.Button | None = None
-        if sync.table_url():
-            ttk.Label(about, text="  ·", foreground="#666").pack(side="left")
-            self.global_var = tk.StringVar()
-            ttk.Label(about, textvariable=self.global_var, foreground="#666").pack(side="left", padx=(4, 0))
-            self.global_btn = ttk.Button(about, text="Refresh", width=8, command=self.refresh_global)
-            self.global_btn.pack(side="left", padx=(6, 0))
-            ttk.Label(about, text="Prefer:", foreground="#666").pack(side="left", padx=(10, 0))
-            self.prefer_var = tk.StringVar(value=self.db.lookup_preference())
-            prefer = ttk.Combobox(about, textvariable=self.prefer_var, values=("local", "global"),
-                                  state="readonly", width=7)
-            prefer.pack(side="left", padx=(4, 0))
-            prefer.bind("<<ComboboxSelected>>", lambda _e: self._set_preference())
+        ttk.Label(footer, text=f"v{__version__}", foreground="#666").pack(side="right")
         ttk.Label(footer, textvariable=self.status, anchor="w").pack(side="left", fill="x", expand=True)
 
     # ------------------------------------------------------------ global table
-    def _set_preference(self) -> None:
-        pref = self.prefer_var.get()
-        self.db.set_setting("lookup_prefer", pref)
-        self.home.lookup(quiet=True)
-        first, second = ("your own records", "the global table") if pref == "local" else ("the global table", "your own records")
-        self.set_status(f"Lookups now prefer {first}, falling back to {second}.")
-
     def _refresh_global_label(self) -> None:
-        if self.global_var is None:
-            return
-        info = self.db.global_info()
-        if not info["synced_at"]:
-            self.global_var.set("Global table: not downloaded yet")
-        else:
-            self.global_var.set(f"Global table: {info['count']} names (synced {info['synced_at'][11:16]})")
+        self.settings.refresh_global_label()
 
     def refresh_global(self) -> None:
         """Download the shared table in a worker thread; the result is applied on the UI thread."""
@@ -255,8 +225,7 @@ class App(tk.Tk):
         if not url or self._sync_busy:
             return
         self._sync_busy = True
-        if self.global_btn is not None:
-            self.global_btn.configure(state="disabled")
+        self.settings.set_refresh_enabled(False)
         etag = self.db.global_info()["etag"]
 
         def work() -> None:  # no tkinter or sqlite calls in here
@@ -277,8 +246,7 @@ class App(tk.Tk):
             self.after(100, self._poll_sync)
             return
         self._sync_busy = False
-        if self.global_btn is not None:
-            self.global_btn.configure(state="normal")
+        self.settings.set_refresh_enabled(True)
         if kind == "error":
             self.set_status(f"Global table: {payload}")
         elif payload.status == "unchanged":
@@ -974,6 +942,71 @@ class RecordsTab(ttk.Frame):
         self.refresh()
         note = f" ({skipped} global table entries skipped)" if skipped else ""
         self.app.set_status(f"Deleted {len(names)} record(s){note}.")
+
+
+# ======================================================================== Settings
+class SettingsTab(ttk.Frame):
+    """Global table (preferred source, refresh) and About."""
+
+    def __init__(self, master: tk.Misc, app: App) -> None:
+        super().__init__(master, padding=10)
+        self.app = app
+        self.global_var: tk.StringVar | None = None
+        self.global_btn: ttk.Button | None = None
+        self._build()
+
+    def _build(self) -> None:
+        if sync.table_url():
+            box = ttk.LabelFrame(self, text="Global table", padding=10)
+            box.pack(fill="x")
+            row = ttk.Frame(box)
+            row.pack(fill="x")
+            ttk.Label(row, text="Preferred source for lookups:").pack(side="left")
+            self.prefer_var = tk.StringVar(value=self.app.db.lookup_preference())
+            prefer = ttk.Combobox(row, textvariable=self.prefer_var, values=("local", "global"),
+                                  state="readonly", width=8)
+            prefer.pack(side="left", padx=(6, 0))
+            prefer.bind("<<ComboboxSelected>>", lambda _e: self._set_preference())
+            ttk.Label(box, text="The other source is the fallback when the preferred one has no record for a name.",
+                      foreground="#666").pack(anchor="w", pady=(2, 8))
+            row = ttk.Frame(box)
+            row.pack(fill="x")
+            self.global_var = tk.StringVar()
+            ttk.Label(row, textvariable=self.global_var).pack(side="left")
+            self.global_btn = ttk.Button(row, text="Refresh now", command=self.app.refresh_global)
+            self.global_btn.pack(side="right")
+            ttk.Label(box, text=f"Server: {sync.table_url()}   |   downloaded on start-up and on Refresh",
+                      foreground="#666").pack(anchor="w", pady=(2, 0))
+            self.refresh_global_label()
+
+        about = ttk.LabelFrame(self, text="About", padding=10)
+        about.pack(fill="x", pady=(10, 0))
+        ttk.Label(about, text=f"Trade Check v{__version__}").pack(anchor="w")
+        link = ttk.Label(about, text=REPO_URL, foreground="#1565c0", cursor="hand2", font=("", 9, "underline"))
+        link.pack(anchor="w", pady=(2, 0))
+        link.bind("<Button-1>", lambda _e: webbrowser.open(REPO_URL))
+        ttk.Label(about, text=f"Database: {self.app.db.path}", foreground="#666").pack(anchor="w", pady=(6, 0))
+
+    def _set_preference(self) -> None:
+        pref = self.prefer_var.get()
+        self.app.db.set_setting("lookup_prefer", pref)
+        self.app.home.lookup(quiet=True)
+        first, second = (("your own records", "the global table") if pref == "local"
+                         else ("the global table", "your own records"))
+        self.app.set_status(f"Lookups now prefer {first}, falling back to {second}.")
+
+    def refresh_global_label(self) -> None:
+        if self.global_var is None:
+            return
+        info = self.app.db.global_info()
+        if not info["synced_at"]:
+            self.global_var.set("Not downloaded yet.")
+        else:
+            self.global_var.set(f"{info['count']} names, version {info['version']}, synced {info['synced_at'][:16]}")
+
+    def set_refresh_enabled(self, on: bool) -> None:
+        if self.global_btn is not None:
+            self.global_btn.configure(state="normal" if on else "disabled")
 
 
 # ======================================================================== Readings
