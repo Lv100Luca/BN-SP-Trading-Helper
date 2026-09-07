@@ -27,13 +27,15 @@ Python 3.10+ with tkinter (bundled on Windows/macOS; on Linux `sudo apt install 
 
 ## Flow
 
-1. **Select region...** - drag a box over where the enemy name appears in-game. Saved for next time.
-   Leave a little space above and beside the name and stop above the "Lvl." line; the preview under
-   READ NAME shows exactly what is captured, so check the whole name is inside.
-2. **Auto-read** is on by default: once a region exists the app captures it every second (interval
-   adjustable, 0.5-5 s) and fills in the name by itself. It skips OCR while the frame is unchanged and
-   only switches to a new name after two consistent reads, so a flickering frame cannot flip it.
-   Untick the box to go manual; **READ NAME** / F5 always does a one-off read.
+1. **Select region...** (on Home until one is set, afterwards in Settings -> Capture) - drag a box over
+   where the enemy name appears in-game. Saved for next time. Leave a little space above and beside the
+   name and stop above the "Lvl." line; **Test capture** in Settings shows exactly what is captured, so
+   check the whole name is inside.
+2. **Auto-read** is on by default (Settings -> Capture: toggle and interval, 0.5-5 s): once a region exists
+   the app captures it every second and fills in the name by itself. It skips OCR while the frame is
+   unchanged and only switches to a new name after two consistent reads, so a flickering frame cannot
+   flip it. The grey line under READ NAME shows what auto-read last saw. **READ NAME** / F5 always does
+   a one-off read.
 3. The panel shows the **previous record** for that name (state, times seen, first/last date) and its
    **history**: a strip of coloured blocks, one per encounter, oldest left, with the share of each state
    underneath. Hover a block for its time. Or "no previous record".

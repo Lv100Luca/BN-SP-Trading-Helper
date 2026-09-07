@@ -513,36 +513,25 @@ class HomeTab(ttk.Frame):
             self.auto_status.set("auto-read starts once a region is selected")
 
     def _build(self) -> None:
+        """Home is the play surface: read, check, save. Capture set-up lives in Settings
+        (build_capture_controls); only a first-run "Select region..." shows here while none is set."""
+        self.region_var = tk.StringVar()
+        self.auto_status = tk.StringVar(value="auto-read off")
+        self.ocr_info = tk.StringVar(value="")
+        self.preview: ttk.Label | None = None
+
         row = ttk.Frame(self)
         row.pack(fill="x")
-        self.region_var = tk.StringVar()
-        ttk.Label(row, textvariable=self.region_var).pack(side="left")
-        ttk.Button(row, text="Test capture", command=self.test_capture).pack(side="right")
-        ttk.Button(row, text="Select region...", command=self.select_region).pack(side="right", padx=(0, 6))
-        ttk.Button(row, text="Mini mode", command=self.app.enter_mini).pack(side="right", padx=(0, 6))
+        ttk.Button(row, text="Mini mode", command=self.app.enter_mini).pack(side="right")
+        self.region_btn = ttk.Button(row, text="Select region...", command=self.select_region)
 
         self.read_btn = tk.Button(
             self, text="READ NAME  (F5)", font=("", 14, "bold"), height=2,
             bg="#1565c0", fg="white", activebackground="#0d47a1", activeforeground="white",
             command=self.read_name,
         )
-        self.read_btn.pack(fill="x", pady=(10, 4))
-
-        auto = ttk.Frame(self)
-        auto.pack(fill="x", pady=(0, 8))
-        ttk.Checkbutton(auto, text="Auto-read every", variable=self._auto_var, command=self._toggle_auto).pack(side="left")
-        ttk.Spinbox(auto, from_=0.5, to=5.0, increment=0.5, width=4, textvariable=self._interval_var,
-                    command=self._toggle_auto).pack(side="left", padx=(4, 2))
-        ttk.Label(auto, text="s").pack(side="left")
-        self.auto_status = tk.StringVar(value="auto-read off")
-        ttk.Label(auto, textvariable=self.auto_status, foreground="#666").pack(side="right")
-
-        self.preview = ttk.Label(self, anchor="center", relief="groove", text="(capture preview)")
-        self.preview.pack(fill="x", ipady=6)
-        self.ocr_info = tk.StringVar(value="")
-        ttk.Label(self, textvariable=self.ocr_info, foreground="#666", wraplength=540, justify="left").pack(
-            anchor="w", pady=(2, 0)
-        )
+        self.read_btn.pack(fill="x", pady=(10, 2))
+        ttk.Label(self, textvariable=self.auto_status, foreground="#666", anchor="e").pack(fill="x", pady=(0, 8))
 
         row = ttk.Frame(self)
         row.pack(fill="x", pady=(10, 4))
@@ -602,13 +591,40 @@ class HomeTab(ttk.Frame):
         if self.app.edit_notes(name, self):
             self.lookup(quiet=True)
 
+    def build_capture_controls(self, parent: tk.Misc) -> None:
+        """Region, test capture, auto-read and the capture preview, placed in the Settings tab."""
+        row = ttk.Frame(parent)
+        row.pack(fill="x")
+        ttk.Label(row, textvariable=self.region_var).pack(side="left")
+        ttk.Button(row, text="Test capture", command=self.test_capture).pack(side="right")
+        ttk.Button(row, text="Select region...", command=self.select_region).pack(side="right", padx=(0, 6))
+        ttk.Label(parent, text="Drag a box over where the enemy name appears; leave a little space around it and "
+                          "stop above the level line. The preview shows exactly what is captured.",
+                  foreground="#666", wraplength=720, justify="left").pack(anchor="w", pady=(2, 8))
+
+        auto = ttk.Frame(parent)
+        auto.pack(fill="x", pady=(0, 8))
+        ttk.Checkbutton(auto, text="Auto-read every", variable=self._auto_var, command=self._toggle_auto).pack(side="left")
+        ttk.Spinbox(auto, from_=0.5, to=5.0, increment=0.5, width=4, textvariable=self._interval_var,
+                    command=self._toggle_auto).pack(side="left", padx=(4, 2))
+        ttk.Label(auto, text="s   (skips unchanged frames; a new name needs two consistent reads)",
+                  foreground="#666").pack(side="left")
+
+        self.preview = ttk.Label(parent, anchor="center", relief="groove", text="(capture preview)")
+        self.preview.pack(fill="x", ipady=6)
+        ttk.Label(parent, textvariable=self.ocr_info, foreground="#666", wraplength=720, justify="left").pack(
+            anchor="w", pady=(2, 0)
+        )
+
     # ------------------------------------------------------------------ region
     def _refresh_region_label(self) -> None:
         r = self.app.region
         if r:
             self.region_var.set(f"Region: x={r[0]} y={r[1]}  {r[2]} x {r[3]} px")
+            self.region_btn.pack_forget()
         else:
             self.region_var.set("Region: not set  ->  click 'Select region...'")
+            self.region_btn.pack(side="right", padx=(0, 6))
 
     def select_region(self) -> None:
         self.app.withdraw()
@@ -639,6 +655,8 @@ class HomeTab(ttk.Frame):
             return None
 
     def _show_preview(self, img) -> None:
+        if self.preview is None:
+            return
         im = img.copy()
         im.thumbnail(PREVIEW_MAX)
         self._preview_img = ImageTk.PhotoImage(im)
@@ -1223,9 +1241,13 @@ class SettingsTab(ttk.Frame):
         self._build()
 
     def _build(self) -> None:
+        cap = ttk.LabelFrame(self, text="Capture", padding=10)
+        cap.pack(fill="x")
+        self.app.home.build_capture_controls(cap)
+
         if sync.table_url():
             box = ttk.LabelFrame(self, text="Global table", padding=10)
-            box.pack(fill="x")
+            box.pack(fill="x", pady=(10, 0))
             row = ttk.Frame(box)
             row.pack(fill="x")
             ttk.Label(row, text="Preferred source for lookups:").pack(side="left")
