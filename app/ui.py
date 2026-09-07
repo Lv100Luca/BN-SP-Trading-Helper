@@ -3,6 +3,7 @@ rename, set state, export) and Settings (global table, contributing)."""
 from __future__ import annotations
 
 import json
+import os
 import queue
 import re
 import sys
@@ -24,7 +25,7 @@ STATE_FG = {"trading": "white", "fighting": "white", "afk": "white", "fake": "#2
 STATE_PALE = {"trading": "#e8f5e9", "fighting": "#ffebee", "afk": "#eeeeee", "fake": "#fff8e1"}
 GLOBAL_PALE = "#e3f2fd"   # previous-record panel when the state comes from the shared table
 PREVIEW_MAX = (520, 140)
-SAVE_COOLDOWN = 15   # default seconds the double click guard ignores clicks for the same name (Settings)
+SAVE_COOLDOWN = 15   # seconds the double click guard ignores clicks for the same name (packaged app)
 
 
 def _fingerprint(img: Image.Image) -> np.ndarray:
@@ -287,12 +288,17 @@ class App(tk.Tk):
         except ValueError:
             return 5
 
-    def save_cooldown(self) -> int:
-        """Seconds the double click guard ignores clicks for the same name (0 = off)."""
-        try:
-            return min(300, max(0, int(self.db.get_setting("save_cooldown", str(SAVE_COOLDOWN)) or SAVE_COOLDOWN)))
-        except ValueError:
-            return SAVE_COOLDOWN
+    @staticmethod
+    def save_cooldown() -> int:
+        """Seconds the double click guard ignores clicks for the same name. Fixed in the packaged app;
+        off when running from source (testing), unless TRADECHECK_SAVE_COOLDOWN says otherwise."""
+        env = os.environ.get("TRADECHECK_SAVE_COOLDOWN")
+        if env is not None:
+            try:
+                return max(0, int(env))
+            except ValueError:
+                pass
+        return SAVE_COOLDOWN if getattr(sys, "frozen", False) else 0
 
     def sharing(self) -> bool:
         return self.db.get_setting("share_uploads") == "1" and bool(self.db.get_setting("contrib_key"))
@@ -1242,20 +1248,6 @@ class SettingsTab(ttk.Frame):
             self._build_sync(box)
             self._build_contribute()
 
-        saving = ttk.LabelFrame(self, text="Saving", padding=10)
-        saving.pack(fill="x", pady=(10, 0))
-        row = ttk.Frame(saving)
-        row.pack(fill="x")
-        ttk.Label(row, text="Double click guard:").pack(side="left")
-        self.cooldown_var = tk.IntVar(value=self.app.save_cooldown())
-        spin = ttk.Spinbox(row, from_=0, to=300, increment=5, width=5, textvariable=self.cooldown_var,
-                           command=self._set_cooldown)
-        spin.pack(side="left", padx=(6, 4))
-        spin.bind("<FocusOut>", lambda _e: self._set_cooldown())
-        spin.bind("<Return>", lambda _e: self._set_cooldown())
-        ttk.Label(row, text="s  (clicks for the same name are ignored this long after a save; 0 = off)",
-                  foreground="#666").pack(side="left")
-
         about = ttk.LabelFrame(self, text="About", padding=10)
         about.pack(fill="x", pady=(10, 0))
         ttk.Label(about, text=f"Trade Check v{__version__}").pack(anchor="w")
@@ -1315,14 +1307,6 @@ class SettingsTab(ttk.Frame):
         self.discard_btn.pack(side="right", padx=(0, 6))
         self._rejected = False   # the server answered 401 to an upload this session
         self.refresh_pending_label()
-
-    def _set_cooldown(self) -> None:
-        try:
-            secs = min(300, max(0, int(self.cooldown_var.get())))
-        except (tk.TclError, ValueError):
-            secs = SAVE_COOLDOWN
-        self.cooldown_var.set(secs)
-        self.app.db.set_setting("save_cooldown", str(secs))
 
     def _set_interval(self) -> None:
         try:
