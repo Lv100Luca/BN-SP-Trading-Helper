@@ -139,9 +139,22 @@ class App(tk.Tk):
             ttk.Label(about, textvariable=self.global_var, foreground="#666").pack(side="left", padx=(4, 0))
             self.global_btn = ttk.Button(about, text="Refresh", width=8, command=self.refresh_global)
             self.global_btn.pack(side="left", padx=(6, 0))
+            ttk.Label(about, text="Prefer:", foreground="#666").pack(side="left", padx=(10, 0))
+            self.prefer_var = tk.StringVar(value=self.db.lookup_preference())
+            prefer = ttk.Combobox(about, textvariable=self.prefer_var, values=("local", "global"),
+                                  state="readonly", width=7)
+            prefer.pack(side="left", padx=(4, 0))
+            prefer.bind("<<ComboboxSelected>>", lambda _e: self._set_preference())
         ttk.Label(footer, textvariable=self.status, anchor="w").pack(side="left", fill="x", expand=True)
 
     # ------------------------------------------------------------ global table
+    def _set_preference(self) -> None:
+        pref = self.prefer_var.get()
+        self.db.set_setting("lookup_prefer", pref)
+        self.home.lookup(quiet=True)
+        first, second = ("your own records", "the global table") if pref == "local" else ("the global table", "your own records")
+        self.set_status(f"Lookups now prefer {first}, falling back to {second}.")
+
     def _refresh_global_label(self) -> None:
         if self.global_var is None:
             return
@@ -569,15 +582,21 @@ class HomeTab(ttk.Frame):
         self.lookup()
 
     def lookup(self, quiet: bool = False) -> None:
-        """Show the record for the name in the box: yours first, else the shared global table.
-        `quiet` re-runs the lookup after a global table refresh and does nothing when the box is empty."""
+        """Show the record for the name in the box from the preferred source (footer setting), the
+        other source as fallback. `quiet` re-runs the lookup after a global table refresh or a
+        preference change and does nothing when the box is empty."""
         name = self.name_var.get().strip()
         if quiet and not name:
             return
-        rec, source = self.app.db.find(name) if name else (None, "")
-        self._show_prev(rec, name, source)
+        if not name:
+            self._show_prev(None, name, "")
+            return
+        local, glob = self.app.db.find_both(name)
+        rec, source = self.app.db.find(name)
+        self._show_prev(rec, name, source, other=(glob if source == "local" else local))
 
-    def _show_prev(self, rec, name: str, source: str = "local") -> None:
+    def _show_prev(self, rec, name: str, source: str = "local", other=None) -> None:
+        """`other` is the record from the source that did not win (shown as a hint), if any."""
         self.current_record = rec
         self.current_source = source if rec is not None else ""
         self.app.update_mini(rec, name, self.current_source)
@@ -588,16 +607,19 @@ class HomeTab(ttk.Frame):
         elif source == "global":
             st = rec["state"]
             notes = f"   |   {rec['notes']}" if rec["notes"] else ""
+            own = (f"Your own record: {STATE_LABELS[other['state']]} (seen {other['times_seen']}x)"
+                   if other is not None else "Not in your own records")
             self._paint_prev(
                 f"{rec['name']}: {STATE_LABELS[st]} in the global table",
-                f"Not in your own records   |   table entry from {rec['updated_at'][:10]}{notes}",
+                f"{own}   |   table entry from {rec['updated_at'][:10]}{notes}",
                 bg=GLOBAL_PALE, fg=STATE_COLORS[st],
             )
         else:
             st = rec["state"]
+            hint = f"   |   global table: {STATE_LABELS[other['state']]}" if other is not None else ""
             self._paint_prev(
                 f"{rec['name']}: previously {STATE_LABELS[st]}",
-                f"Seen {rec['times_seen']}x   |   first {rec['created_at']}   |   last {rec['updated_at']}",
+                f"Seen {rec['times_seen']}x   |   first {rec['created_at']}   |   last {rec['updated_at']}{hint}",
                 bg=STATE_PALE[st], fg=STATE_COLORS[st],
             )
 
@@ -617,7 +639,7 @@ class HomeTab(ttk.Frame):
         rec = self.app.db.upsert(name, state)
         if self.app.log is not None and self.reading_id is not None:
             self.app.db.mark_reading_saved(self.reading_id, rec["name"], state)
-        self._show_prev(rec, name, "local")
+        self._show_prev(rec, name, "local", other=self.app.db.get_global(name))
         if prev is not None and prev["state"] != state:
             self.app.set_status(
                 f"{rec['name']}: {STATE_LABELS[prev['state']]} -> {STATE_LABELS[state]} (overwritten)"
@@ -645,17 +667,27 @@ class RecordsTab(ttk.Frame):
         combo = ttk.Combobox(top, textvariable=self.filter_var, values=("all", *STATES), state="readonly", width=9)
         combo.pack(side="left")
         combo.bind("<<ComboboxSelected>>", lambda _e: self.refresh())
+        # Which table(s) to list. Only your own records when the global table feature is off.
+        self.source_var = tk.StringVar(value="local")
+        if sync.table_url():
+            saved = self.app.db.get_setting("records_source", "both") or "both"
+            self.source_var.set(saved if saved in Database.SOURCES else "both")
+            ttk.Label(top, text="Source:").pack(side="left", padx=(10, 0))
+            src = ttk.Combobox(top, textvariable=self.source_var, values=Database.SOURCES, state="readonly", width=7)
+            src.pack(side="left", padx=(4, 0))
+            src.bind("<<ComboboxSelected>>", lambda _e: self._source_changed())
 
         self.count_var = tk.StringVar()
         ttk.Label(self, textvariable=self.count_var, foreground="#666").pack(anchor="w", pady=(6, 2))
 
         table = ttk.Frame(self)
         table.pack(fill="both", expand=True)
-        cols = ("name", "state", "seen", "updated")
+        cols = ("name", "state", "source", "seen", "updated")
         self.tree = ttk.Treeview(table, columns=cols, show="headings", selectmode="extended")
         for col, text, width, anchor in (
             ("name", "Name", 220, "w"),
             ("state", "State", 90, "center"),
+            ("source", "Source", 60, "center"),
             ("seen", "Seen", 60, "center"),
             ("updated", "Last updated", 150, "w"),
         ):
@@ -687,32 +719,43 @@ class RecordsTab(ttk.Frame):
         ttk.Button(tools, text="Delete", command=self.delete_selected).pack(side="right")
         ttk.Button(tools, text="Refresh", command=self.refresh).pack(side="right", padx=(0, 6))
 
+    def _source_changed(self) -> None:
+        self.app.db.set_setting("records_source", self.source_var.get())
+        self.refresh()
+
+    @staticmethod
+    def _iid(source: str, name: str) -> str:
+        return f"{source}:{name}"
+
     def refresh(self) -> None:
-        q = self.search_var.get().strip()
-        f = self.filter_var.get()
-        rows = self.app.db.all(q, None if f == "all" else f)
+        rows, _ = self._current_rows()
         selected = set(self.tree.selection())
         self.tree.delete(*self.tree.get_children())
         for r in rows:
+            seen = r["times_seen"] if r["source"] == "local" else "-"
             self.tree.insert(
-                "", "end", iid=r["name"],
-                values=(r["name"], STATE_LABELS[r["state"]], r["times_seen"], r["updated_at"]),
+                "", "end", iid=self._iid(r["source"], r["name"]),
+                values=(r["name"], STATE_LABELS[r["state"]], r["source"], seen, r["updated_at"]),
                 tags=(r["state"],),
             )
-        keep = [r["name"] for r in rows if r["name"] in selected]
+        keep = [i for i in (self._iid(r["source"], r["name"]) for r in rows) if i in selected]
         if keep:
             self.tree.selection_set(keep)
-        c = self.app.db.counts()
-        total = sum(c.values())
-        self.count_var.set(
-            f"{len(rows)} shown / {total} total   "
-            f"(trading {c.get('trading', 0)}, fighting {c.get('fighting', 0)}, afk {c.get('afk', 0)})"
-        )
+        source = self.source_var.get()
+        parts = []
+        if source in ("both", "local"):
+            c = self.app.db.counts("local")
+            parts.append(f"{sum(c.values())} own (trading {c.get('trading', 0)}, fighting {c.get('fighting', 0)}, "
+                         f"afk {c.get('afk', 0)}, fake {c.get('fake', 0)})")
+        if source in ("both", "global"):
+            parts.append(f"{sum(self.app.db.counts('global').values())} global")
+        self.count_var.set(f"{len(rows)} shown / " + ", ".join(parts))
 
     def _current_rows(self):
         q = self.search_var.get().strip()
         f = self.filter_var.get()
-        return self.app.db.all(q, None if f == "all" else f), (q == "" and f == "all")
+        rows = self.app.db.all(q, None if f == "all" else f, self.source_var.get())
+        return rows, (q == "" and f == "all")
 
     def export_rows(self) -> None:
         """Save the rows currently listed (all records unless a search/filter is active) as JSON (or CSV)."""
@@ -757,6 +800,10 @@ class RecordsTab(ttk.Frame):
     def _selected_names(self) -> list[str]:
         return [self.tree.item(i, "values")[0] for i in self.tree.selection()]
 
+    def _selected(self) -> list[tuple[str, str]]:
+        """(name, source) per selected row."""
+        return [(v[0], v[2]) for v in (self.tree.item(i, "values") for i in self.tree.selection())]
+
     def load_selected(self, _e=None) -> None:
         names = self._selected_names()
         if not names:
@@ -765,23 +812,38 @@ class RecordsTab(ttk.Frame):
         self.app.nb.select(0)
 
     def set_selected_state(self, state: str) -> None:
-        names = self._selected_names()
-        for n in names:
-            self.app.db.set_state(n, state)
+        """Own records change state in place. A global row cannot be edited, so setting a state on
+        it creates (or updates) your own record for that name instead."""
+        picked = self._selected()
+        adopted = 0
+        for name, source in picked:
+            if source == "local":
+                self.app.db.set_state(name, state)
+            else:
+                glob = self.app.db.get_global(name)
+                self.app.db.upsert(name, state, glob["notes"] if glob is not None else None)
+                adopted += 1
         self.refresh()
-        if names:
-            self.app.set_status(f"Set {len(names)} record(s) to {STATE_LABELS[state]}.")
+        if picked:
+            extra = f" ({adopted} copied from the global table into your records)" if adopted else ""
+            self.app.set_status(f"Set {len(picked)} record(s) to {STATE_LABELS[state]}{extra}.")
 
     def delete_selected(self, _e=None) -> None:
-        names = self._selected_names()
+        picked = self._selected()
+        names = [n for n, src in picked if src == "local"]
+        skipped = len(picked) - len(names)
+        if not picked:
+            return
         if not names:
+            messagebox.showinfo("Delete", "Global table entries cannot be deleted; only your own records can.")
             return
         if not messagebox.askyesno("Delete", f"Delete {len(names)} record(s)?"):
             return
         for n in names:
             self.app.db.delete(n)
         self.refresh()
-        self.app.set_status(f"Deleted {len(names)} record(s).")
+        note = f" ({skipped} global table entries skipped)" if skipped else ""
+        self.app.set_status(f"Deleted {len(names)} record(s){note}.")
 
 
 # ======================================================================== Readings

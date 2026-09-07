@@ -204,13 +204,23 @@ class Database:
             ).fetchone()
         return row
 
-    def find(self, name: str) -> tuple[sqlite3.Row | None, str]:
-        """Your own record first, then the shared global table. Returns (row, "local" | "global" | "")."""
-        rec = self.get(name)
-        if rec is not None:
-            return rec, "local"
-        rec = self.get_global(name)
-        return rec, ("global" if rec is not None else "")
+    def lookup_preference(self) -> str:
+        """Which source wins when a name is in both tables: "local" (default) or "global"."""
+        return "global" if self.get_setting("lookup_prefer") == "global" else "local"
+
+    def find_both(self, name: str) -> tuple[sqlite3.Row | None, sqlite3.Row | None]:
+        return self.get(name), self.get_global(name)
+
+    def find(self, name: str, prefer: str | None = None) -> tuple[sqlite3.Row | None, str]:
+        """The record from the preferred source, the other one as fallback.
+        Returns (row, "local" | "global" | "")."""
+        local, glob = self.find_both(name)
+        prefer = prefer or self.lookup_preference()
+        order = ((glob, "global"), (local, "local")) if prefer == "global" else ((local, "local"), (glob, "global"))
+        for rec, source in order:
+            if rec is not None:
+                return rec, source
+        return None, ""
 
     def upsert(self, name: str, state: str, notes: str | None = None) -> sqlite3.Row:
         """Record an encounter: insert, or overwrite state and bump times_seen."""
@@ -252,8 +262,20 @@ class Database:
         )
         self.conn.commit()
 
-    def all(self, query: str = "", state: str | None = None) -> list[sqlite3.Row]:
-        sql = "SELECT * FROM records"
+    # Every row carries a `source` column. Global rows have no encounter count (times_seen = 0)
+    # and no first-seen time (created_at = updated_at), so exports and the list treat them alike.
+    _LOCAL_SQL = "SELECT id, name, state, notes, times_seen, created_at, updated_at, 'local' AS source FROM records"
+    _GLOBAL_SQL = ("SELECT NULL AS id, name, state, notes, 0 AS times_seen, updated_at AS created_at, updated_at, "
+                   "'global' AS source FROM global_records")
+    SOURCES = ("both", "local", "global")
+
+    def all(self, query: str = "", state: str | None = None, source: str = "local") -> list[sqlite3.Row]:
+        """Records from your own table, the shared global table, or both unified."""
+        if source not in self.SOURCES:
+            raise ValueError(f"unknown source {source!r}")
+        inner = {"local": self._LOCAL_SQL, "global": self._GLOBAL_SQL,
+                 "both": f"{self._LOCAL_SQL} UNION ALL {self._GLOBAL_SQL}"}[source]
+        sql = f"SELECT * FROM ({inner})"
         where, params = [], []
         if query:
             where.append("name LIKE ? COLLATE NOCASE")
@@ -363,13 +385,15 @@ class Database:
         self.conn.commit()
         return {"action": action, "old": src["name"], "name": new}
 
-    def counts(self) -> dict[str, int]:
-        rows = self.conn.execute("SELECT state, COUNT(*) AS n FROM records GROUP BY state")
+    def counts(self, source: str = "local") -> dict[str, int]:
+        table = "global_records" if source == "global" else "records"
+        rows = self.conn.execute(f"SELECT state, COUNT(*) AS n FROM {table} GROUP BY state")
         return {r["state"]: r["n"] for r in rows}
 
     # ------------------------------------------------------------- global table
     # A copy of the shared read-only table the server hands out (app/sync.py fetches it; only
-    # replace_global() writes here). Looked up only when there is no local record for a name.
+    # replace_global() writes here). find() consults it before or after your own records
+    # depending on the lookup preference.
     def get_global(self, name: str) -> sqlite3.Row | None:
         name = normalize_name(name)
         if not name:
