@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -1137,7 +1138,12 @@ class SettingsTab(ttk.Frame):
         self.app.db.set_setting("sync_interval", str(minutes))
 
     def _save_key(self) -> None:
-        key = self.key_var.get().strip()
+        key = "".join(self.key_var.get().split())
+        if key and not re.fullmatch(r"tck_[0-9a-f]{48}", key):
+            messagebox.showerror("Contributor key", "That is not a contributor key. It looks like "
+                                 "tck_ followed by 48 hex characters and is printed once by "
+                                 "tools/manage_keys.py create.")
+            return
         self.key_var.set(key)
         self.app.db.set_setting("contrib_key", key)
         self.app.set_status("Contributor key saved." if key else "Contributor key removed.")
