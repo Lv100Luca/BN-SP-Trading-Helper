@@ -19,10 +19,17 @@ from PIL import Image, ImageTk
 from . import REPO_URL, __version__, capture, export, ocr, sync
 from .db import STATES, Database, name_key
 
-STATE_LABELS = {"trading": "TRADING", "fighting": "FIGHTING", "afk": "AFK", "fake": "FAKE"}
-STATE_COLORS = {"trading": "#2e7d32", "fighting": "#c62828", "afk": "#616161", "fake": "#f9a825"}
-STATE_FG = {"trading": "white", "fighting": "white", "afk": "white", "fake": "#212121"}  # button text
-STATE_PALE = {"trading": "#e8f5e9", "fighting": "#ffebee", "afk": "#eeeeee", "fake": "#fff8e1"}
+STATE_LABELS = {"trading": "TRADING", "fighting": "FIGHTING", "climbing": "CLIMBING", "dropping": "DROPPING",
+                "afk": "STALLING", "fake": "TRAITOR"}
+STATE_COLORS = {"trading": "#2e7d32", "fighting": "#c62828", "climbing": "#1565c0", "dropping": "#f9a825",
+                "afk": "#616161", "fake": "#000000"}
+STATE_FG = {"trading": "white", "fighting": "white", "climbing": "white", "dropping": "#212121",
+            "afk": "white", "fake": "white"}  # button text
+STATE_PALE = {"trading": "#e8f5e9", "fighting": "#ffebee", "climbing": "#e3f2fd", "dropping": "#fff8e1",
+              "afk": "#eeeeee", "fake": "#e0e0e0"}
+LABEL_TO_STATE = {v.lower(): k for k, v in STATE_LABELS.items()}
+# Button layout for the big save buttons (home tab and mini HUD).
+STATE_ROWS = (("trading", "climbing", "dropping"), ("fighting", "afk", "fake"))
 PREVIEW_MAX = (520, 140)
 MIN_SIZE = (640, 640)   # smallest window; also the size on first start (the last size is restored later)
 SAVE_COOLDOWN = 15   # seconds the double click guard ignores clicks for the same name (packaged app)
@@ -130,13 +137,13 @@ class HistoryBar(tk.Canvas):
 
 
 def history_summary(rows: list) -> str:
-    """Share of each state in a timeline, most common first: 'trading 59%  |  fake 23%  |  afk 18%'."""
+    """Share of each state in a timeline, most common first: 'trading 59%  |  traitor 23%  |  stalling 18%'."""
     counts: dict[str, int] = {}
     for r in rows:
         counts[r["state"]] = counts.get(r["state"], 0) + 1
     total = sum(counts.values()) or 1
     ranked = sorted(counts.items(), key=lambda kv: (-kv[1], STATES.index(kv[0])))
-    return "  |  ".join(f"{st} {round(100 * n / total)}%" for st, n in ranked)
+    return "  |  ".join(f"{STATE_LABELS[st].lower()} {round(100 * n / total)}%" for st, n in ranked)
 
 
 def newest(local, glob):
@@ -694,13 +701,15 @@ class HomeTab(ttk.Frame):
         ttk.Label(self, text="Record the current state (added to this player's history):").pack(
             side="bottom", anchor="w", fill="x", pady=(8, 2))
         self.prev_frame.pack(fill="x", pady=6)
-        for st in STATES:
-            tk.Button(
-                state_row, text=STATE_LABELS[st], font=("", 12, "bold"), height=2,
-                bg=STATE_COLORS[st], fg=STATE_FG[st],
-                activebackground=STATE_COLORS[st], activeforeground=STATE_FG[st],
-                command=lambda s=st: self.save_state(s),
-            ).pack(side="left", fill="x", expand=True, padx=3)
+        for r, states in enumerate(STATE_ROWS):
+            for c, st in enumerate(states):
+                state_row.columnconfigure(c, weight=1, uniform="state")
+                tk.Button(
+                    state_row, text=STATE_LABELS[st], font=("", 12, "bold"), height=2,
+                    bg=STATE_COLORS[st], fg=STATE_FG[st],
+                    activebackground=STATE_COLORS[st], activeforeground=STATE_FG[st],
+                    command=lambda s=st: self.save_state(s),
+                ).grid(row=r, column=c, sticky="ew", padx=3, pady=2)
         self.cooldown_var = tk.StringVar()
         # fixed button width and a wrapping label, so the countdown never changes the window width
         self.undo_btn = ttk.Button(row, text="Undo last save", command=self.undo_save, state="disabled", width=30)
@@ -1110,7 +1119,8 @@ class RecordsTab(ttk.Frame):
         self.search_var.trace_add("write", lambda *_: self.refresh())
         ttk.Entry(top, textvariable=self.search_var).pack(side="left", fill="x", expand=True, padx=6)
         self.filter_var = tk.StringVar(value="all")
-        combo = ttk.Combobox(top, textvariable=self.filter_var, values=("all", *STATES), state="readonly", width=9)
+        combo = ttk.Combobox(top, textvariable=self.filter_var, state="readonly", width=9,
+                             values=("all", *(STATE_LABELS[st].lower() for st in STATES)))
         combo.pack(side="left")
         combo.bind("<<ComboboxSelected>>", lambda _e: self.refresh())
         # Which table(s) to list. Only your own records when the global table feature is off.
@@ -1202,8 +1212,8 @@ class RecordsTab(ttk.Frame):
         parts = []
         if source in ("both", "local"):
             c = self.app.db.counts("local")
-            parts.append(f"{sum(c.values())} own (trading {c.get('trading', 0)}, fighting {c.get('fighting', 0)}, "
-                         f"afk {c.get('afk', 0)}, fake {c.get('fake', 0)})")
+            detail = ", ".join(f"{STATE_LABELS[st].lower()} {c.get(st, 0)}" for st in STATES)
+            parts.append(f"{sum(c.values())} own ({detail})")
         if source in ("both", "global"):
             parts.append(f"{sum(self.app.db.counts('global').values())} global")
         self.count_var.set(f"{len(rows)} shown / " + ", ".join(parts))
@@ -1222,18 +1232,23 @@ class RecordsTab(ttk.Frame):
         self.history_panel.set(lrows, grows)
         self.history_lbl.configure(text=f"History of {name}" + ("" if lrows or grows else ": none"))
 
+    def _filter_state(self):
+        """Combobox shows labels; the DB wants keys."""
+        f = self.filter_var.get()
+        return None if f == "all" else LABEL_TO_STATE.get(f, f)
+
     def _current_rows(self):
         q = self.search_var.get().strip()
-        f = self.filter_var.get()
-        rows = self.app.db.all(q, None if f == "all" else f, self.source_var.get())
-        return rows, (q == "" and f == "all")
+        f = self._filter_state()
+        rows = self.app.db.all(q, f, self.source_var.get())
+        return rows, (q == "" and f is None)
 
     def export_rows(self) -> None:
         """Save your own records (the current search/filter applied, never the global table's copy)
         as JSON (or CSV)."""
-        q, f = self.search_var.get().strip(), self.filter_var.get()
-        rows = self.app.db.all(q, None if f == "all" else f, "local")
-        is_everything = q == "" and f == "all"
+        q, f = self.search_var.get().strip(), self._filter_state()
+        rows = self.app.db.all(q, f, "local")
+        is_everything = q == "" and f is None
         if not rows:
             messagebox.showinfo("Export", "No records to export.")
             return
@@ -1684,7 +1699,8 @@ class SettingsTab(ttk.Frame):
 MINI_BG = "#202124"
 MINI_FG = "#f5f5f5"
 MINI_DIM = "#9e9e9e"
-MINI_STATE_FG = {"trading": "#66bb6a", "fighting": "#ef5350", "afk": "#bdbdbd", "fake": "#ffd54f"}
+MINI_STATE_FG = {"trading": "#66bb6a", "fighting": "#ef5350", "climbing": "#64b5f6", "dropping": "#ffd54f",
+                 "afk": "#bdbdbd", "fake": "#eeeeee"}
 MINI_NEW_FG = "#80d8ff"
 MINI_HISTORY = 10   # encounters shown on the mini HUD strip
 
@@ -1731,13 +1747,15 @@ class MiniWindow(tk.Toplevel):
 
         btns = tk.Frame(self, bg=MINI_BG)
         btns.pack(fill="x", padx=4, pady=4)
-        for st in STATES:
-            tk.Button(
-                btns, text=STATE_LABELS[st], bg=STATE_COLORS[st], fg=STATE_FG[st],
-                activebackground=STATE_COLORS[st], activeforeground=STATE_FG[st],
-                font=("", 9, "bold"), bd=0, padx=6, pady=3,
-                command=lambda s=st: app.home.save_state(s),
-            ).pack(side="left", fill="x", expand=True, padx=2)
+        for r, states in enumerate(STATE_ROWS):
+            for c, st in enumerate(states):
+                btns.columnconfigure(c, weight=1, uniform="state")
+                tk.Button(
+                    btns, text=STATE_LABELS[st], bg=STATE_COLORS[st], fg=STATE_FG[st],
+                    activebackground=STATE_COLORS[st], activeforeground=STATE_FG[st],
+                    font=("", 9, "bold"), bd=0, padx=6, pady=3,
+                    command=lambda s=st: app.home.save_state(s),
+                ).grid(row=r, column=c, sticky="ew", padx=2, pady=1)
 
         foot = tk.Label(self, textvariable=app.home.auto_status, fg="#777777", bg=MINI_BG, font=("", 7), anchor="w")
         foot.pack(fill="x", padx=6, pady=(0, 3))

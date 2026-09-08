@@ -11,7 +11,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
-STATES = ("trading", "fighting", "afk", "fake")
+# Keys are stored in the DB and shared table; "afk" is shown as STALLING and "fake" as TRAITOR.
+STATES = ("trading", "fighting", "climbing", "dropping", "afk", "fake")
 APP_NAME = "TradeCheck"
 
 ROOT = Path(__file__).resolve().parent.parent

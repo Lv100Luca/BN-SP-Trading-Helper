@@ -2,7 +2,7 @@
 
 Tiny cross-platform desktop tool: capture a region of the screen where an enemy's name is
 shown, OCR the name, show what you recorded about that player last time, and save the
-current state (**trading / fighting / afk / fake**). Records live in a local SQLite file shared by the source checkout and the packaged exe.
+current state (**trading / fighting / climbing / dropping / stalling / traitor**). Records live in a local SQLite file shared by the source checkout and the packaged exe.
 
 ## Run
 
@@ -42,7 +42,8 @@ Python 3.10+ with tkinter (bundled on Windows/macOS; on Linux `sudo apt install 
    one per sighting, oldest left, with the share of each state. Hover a block for its time. The headline
    and colour follow whichever source changed last. Or "no previous record".
 4. Fix the name in the text box if OCR got it slightly wrong (auto-read pauses while you type), then click
-   **TRADING / FIGHTING / AFK / FAKE**. The state becomes the current one and is added to the history.
+   one of **TRADING / FIGHTING / CLIMBING / DROPPING / STALLING / TRAITOR**. The state becomes the current one
+   and is added to the history.
    Misclicked? **Undo last save** takes the encounter back again (also on the mini HUD). Further clicks
    for the same name are ignored for 15 s (a countdown shows), so a double click cannot count twice.
 5. **Records** tab (name, state, notes, source, seen, last updated): search, filter by state, double-click

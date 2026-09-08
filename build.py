@@ -109,7 +109,7 @@ QUICK_START = """Trade Check v{version} ({platform})
 =================================
 
 Reads the enemy name from the game's top-right nameplate and remembers whether that player
-was TRADING, FIGHTING, AFK or FAKE the last time you met.
+was TRADING, FIGHTING, CLIMBING, DROPPING, STALLING or TRAITOR the last time you met.
 
 Quick start
 -----------
@@ -118,7 +118,8 @@ Quick start
    click "More info", then "Run anyway".
 2. Click "Select region..." and drag a box around the enemy name: leave a little space
    above it and stop above the "Lvl." line. Auto-read starts right away.
-3. When a name appears, click TRADING / FIGHTING / AFK / FAKE. Next time you meet that player,
+3. When a name appears, click one of the state buttons (TRADING, FIGHTING, CLIMBING, DROPPING,
+   STALLING, TRAITOR). Next time you meet that player,
    the previous state is shown. Use the Records tab to search or edit.
 4. "Mini mode" shrinks the app to a small always-on-top overlay to keep over the game
    (windowed or borderless mode; exclusive fullscreen hides overlays).
