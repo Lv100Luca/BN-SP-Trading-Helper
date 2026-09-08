@@ -1,6 +1,7 @@
 """Cross-platform screen capture (mss) and a drag-to-select region overlay (tkinter)."""
 from __future__ import annotations
 
+import sys
 import tkinter as tk
 
 import mss
@@ -41,6 +42,29 @@ def grab(region: Region, margin: int = GRAB_MARGIN) -> Image.Image:
     return Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
 
 
+PERMISSION_HINT = (
+    "macOS is blocking screen capture for Trade Check, so every capture shows only the wallpaper.\n\n"
+    "System Settings > Privacy & Security > Screen Recording: switch on Trade Check (or the Terminal "
+    "you started it from), then quit and start Trade Check again."
+)
+
+
+def screen_capture_allowed() -> bool:
+    """False while macOS (10.15+) has not granted Screen Recording. The first call without it also
+    shows the system prompt and puts the app on the Screen Recording list. True everywhere else."""
+    if sys.platform != "darwin":
+        return True
+    try:
+        import ctypes
+
+        cg = ctypes.CDLL("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+        cg.CGPreflightScreenCaptureAccess.restype = ctypes.c_bool
+        cg.CGRequestScreenCaptureAccess.restype = ctypes.c_bool
+        return bool(cg.CGPreflightScreenCaptureAccess()) or bool(cg.CGRequestScreenCaptureAccess())
+    except (OSError, AttributeError):
+        return True   # older macOS, no permission system
+
+
 def grab_full() -> Image.Image:
     with mss.mss() as sct:
         shot = sct.grab(sct.monitors[0])
@@ -59,7 +83,14 @@ class RegionSelector:
     def select(self) -> Region | None:
         vs = virtual_screen()
         top = tk.Toplevel(self.root)
-        top.overrideredirect(True)
+        top.title("Select region")
+        if sys.platform != "darwin":
+            # A borderless film over the whole virtual screen. Not on macOS: there a borderless
+            # (overrideredirect) window never receives key presses, so Esc could not cancel, and
+            # some macOS releases stopped delivering mouse input to borderless windows entirely.
+            # An ordinary window does the job; macOS keeps it below the menu bar, which is why the
+            # selection is taken from the pointer's screen position, not from the window's origin.
+            top.overrideredirect(True)
         top.geometry(f"{vs['width']}x{vs['height']}+{vs['left']}+{vs['top']}")
         top.attributes("-topmost", True)
         try:
@@ -70,17 +101,18 @@ class RegionSelector:
 
         canvas = tk.Canvas(top, bg="black", highlightthickness=0, cursor="crosshair")
         canvas.pack(fill="both", expand=True)
-        canvas.create_text(
+        hint = canvas.create_text(
             vs["width"] // 2, 40,
-            text="Drag a box around the enemy name.  Release to confirm.  Esc to cancel.",
+            text="Drag a box around the enemy name.  Release to confirm.  Esc or right-click to cancel.",
             fill="white", font=("", 14, "bold"),
         )
+        canvas.bind("<Configure>", lambda e: canvas.coords(hint, e.width // 2, 40))
 
-        start: list[int] = []
+        start: list[int] = []   # canvas x, y of the press, then its screen x, y
         rect = {"id": None}
 
         def on_press(e: tk.Event) -> None:
-            start[:] = [e.x, e.y]
+            start[:] = [e.x, e.y, e.x_root, e.y_root]
             if rect["id"] is not None:
                 canvas.delete(rect["id"])
             rect["id"] = canvas.create_rectangle(e.x, e.y, e.x, e.y, outline="#00e5ff", width=2)
@@ -92,13 +124,11 @@ class RegionSelector:
         def on_release(e: tk.Event) -> None:
             if not start:
                 return
-            x0, y0 = start
-            x1, y1 = e.x, e.y
-            left, right = sorted((x0, x1))
-            topp, bottom = sorted((y0, y1))
+            left, right = sorted((start[2], e.x_root))
+            topp, bottom = sorted((start[3], e.y_root))
             w, h = right - left, bottom - topp
             if w >= self.MIN_SIZE and h >= self.MIN_SIZE:
-                self.result = (vs["left"] + left, vs["top"] + topp, w, h)
+                self.result = (left, topp, w, h)
             top.destroy()
 
         def on_cancel(_e: tk.Event) -> None:
@@ -109,6 +139,8 @@ class RegionSelector:
         canvas.bind("<B1-Motion>", on_drag)
         canvas.bind("<ButtonRelease-1>", on_release)
         top.bind("<Escape>", on_cancel)
+        for seq in ("<Button-2>", "<Button-3>"):   # the right mouse button: 3 on Windows/X11, 2 on macOS
+            canvas.bind(seq, on_cancel)
 
         top.update_idletasks()
         top.lift()

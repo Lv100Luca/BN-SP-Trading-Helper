@@ -124,6 +124,12 @@ Quick start
 4. "Mini mode" shrinks the app to a small always-on-top overlay to keep over the game
    (windowed or borderless mode; exclusive fullscreen hides overlays).
 
+macOS: start TradeCheck.app (right-click > Open the first time, it is not notarised). The first
+"Select region..." asks for Screen Recording permission - switch it on in System Settings >
+Privacy & Security > Screen Recording, then quit and start the app again; without it every
+capture shows only the wallpaper. Run the game in a window: a full-screen game gets its own
+Space that no overlay can appear on.
+
 Your records live in one shared per-user database (Windows: %APPDATA%/TradeCheck/records.sqlite),
 so this exe and a source checkout on the same machine see the same data. Back that file up to keep
 your records. A data folder from an older version next to the exe is merged in automatically.

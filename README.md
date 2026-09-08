@@ -61,6 +61,13 @@ Python 3.10+ with tkinter (bundled on Windows/macOS; on Linux `sudo apt install 
 
 Tip: keep the app window (or a second monitor) clear of the capture region.
 
+**macOS:** start `TradeCheck.app` from the zip (right-click > Open the first time; the build is not
+notarised). The first **Select region...** asks for *Screen Recording* permission; switch it on under
+System Settings > Privacy & Security > Screen Recording, then quit and start the app again. Without it
+every capture shows only the wallpaper. Run the game in a window: a full-screen game lives in its own
+Space where no overlay can appear. On macOS the region selector is an ordinary window (borderless
+windows there do not take key presses), so it sits below the menu bar; right-click or Esc cancels.
+
 ## Where the data lives
 
 Both the source checkout and the packaged exe use one shared per-user database:

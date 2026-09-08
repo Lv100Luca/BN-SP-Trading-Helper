@@ -203,6 +203,40 @@ def autowrap(label: tk.Misc, pad: int = 4) -> None:
     label.bind("<Configure>", lambda e: label.configure(wraplength=max(60, e.width - pad)))
 
 
+class ColorButton(tk.Label):
+    """A push button whose colours show on every platform. tk.Button draws a native Aqua button on
+    macOS and ignores bg/activebackground there (the state buttons came out grey with white text),
+    so the coloured buttons are labels with button behaviour: raised, sunken while pressed,
+    `activebackground` on hover, `command` fired on release inside, inert while disabled."""
+
+    def __init__(self, master: tk.Misc, command=None, **kw) -> None:
+        kw.setdefault("relief", "raised")
+        kw.setdefault("bd", 2)
+        kw.setdefault("padx", 3)
+        kw.setdefault("pady", 1)
+        super().__init__(master, **kw)
+        self.command = command
+        self._relief = kw["relief"]
+        self.bind("<Enter>", lambda _e: self._switch("normal", "active"))
+        self.bind("<Leave>", lambda _e: self._switch("active", "normal"))
+        self.bind("<ButtonPress-1>", self._press)
+        self.bind("<ButtonRelease-1>", self._release)
+
+    def _switch(self, when: str, to: str) -> None:
+        if str(self.cget("state")) == when:
+            self.configure(state=to)
+
+    def _press(self, _e: tk.Event) -> None:
+        if str(self.cget("state")) != "disabled":
+            self.configure(relief="sunken")
+
+    def _release(self, e: tk.Event) -> None:
+        self.configure(relief=self._relief)
+        inside = 0 <= e.x < self.winfo_width() and 0 <= e.y < self.winfo_height()
+        if inside and self.command is not None and str(self.cget("state")) != "disabled":
+            self.command()
+
+
 class NotesDialog(tk.Toplevel):
     """Modal editor for one record's note. One large button per preset (Settings -> Note presets)
     puts that preset's text into the box; typing stays possible. ask() returns the new text, or
@@ -303,6 +337,9 @@ class App(tk.Tk):
                 f"Moved records to the shared database ({self.db.path}): {r['added']} added, "
                 f"{r['updated']} updated from {r['source']}"
             )
+        if not capture.screen_capture_allowed():
+            self.status.set("macOS has not allowed Screen Recording for Trade Check - captures stay empty until "
+                            "it is switched on in System Settings > Privacy & Security and the app is restarted.")
         self._build_footer()   # packed first so a shrinking window squeezes the tabs, not the footer
         self.nb = ttk.Notebook(self)
         self.nb.pack(fill="both", expand=True, padx=6, pady=(6, 0))
@@ -660,7 +697,7 @@ class HomeTab(ttk.Frame):
         ttk.Button(row, text="Mini mode", command=self.app.enter_mini).pack(side="right")
         self.region_btn = ttk.Button(row, text="Select region...", command=self.select_region)
 
-        self.read_btn = tk.Button(
+        self.read_btn = ColorButton(
             self, text="READ NAME  (F5)", font=("", 14, "bold"), height=2,
             bg="#1565c0", fg="white", activebackground="#0d47a1", activeforeground="white",
             command=self.read_name,
@@ -704,7 +741,7 @@ class HomeTab(ttk.Frame):
         for r, states in enumerate(STATE_ROWS):
             for c, st in enumerate(states):
                 state_row.columnconfigure(c, weight=1, uniform="state")
-                tk.Button(
+                ColorButton(
                     state_row, text=STATE_LABELS[st], font=("", 12, "bold"), height=2,
                     bg=STATE_COLORS[st], fg=STATE_FG[st],
                     activebackground=STATE_COLORS[st], activeforeground=STATE_FG[st],
@@ -769,6 +806,9 @@ class HomeTab(ttk.Frame):
             self.region_btn.pack(side="right", padx=(0, 6))
 
     def select_region(self) -> None:
+        if not capture.screen_capture_allowed() and not messagebox.askyesno(
+                "Screen Recording permission", capture.PERMISSION_HINT + "\n\nOpen the region selector anyway?"):
+            return
         self.app.withdraw()
         self.app.update()
         try:
@@ -1174,7 +1214,7 @@ class RecordsTab(ttk.Frame):
         ttk.Button(btns, text="Notes...", command=self.notes_selected).pack(side="left", padx=(6, 0))
         ttk.Label(btns, text="Set:").pack(side="left", padx=(10, 0))
         for st in STATES:
-            tk.Button(
+            ColorButton(
                 btns, text=STATE_LABELS[st], bg=STATE_COLORS[st], fg=STATE_FG[st],
                 activebackground=STATE_COLORS[st], activeforeground=STATE_FG[st],
                 command=lambda s=st: self.set_selected_state(s),
@@ -1419,6 +1459,8 @@ class SettingsTab(ttk.Frame):
         link.pack(anchor="w", pady=(2, 0))
         link.bind("<Button-1>", lambda _e: webbrowser.open(REPO_URL))
         ttk.Label(about, text=f"Database: {self.app.db.path}", foreground="#666").pack(anchor="w", pady=(6, 0))
+        ttk.Label(about, text=f"Python {sys.version.split()[0]}  -  Tk {self.tk.call('set', 'tk_patchLevel')}  -  "
+                              f"{sys.platform}", foreground="#666").pack(anchor="w")
 
     def _build_sync(self, box: ttk.LabelFrame) -> None:
         db = self.app.db
@@ -1730,9 +1772,9 @@ class MiniWindow(tk.Toplevel):
                                  font=("", 12, "bold"), anchor="w")
         self.name_lbl.pack(side="left", fill="x", expand=True)
         small = dict(bg=MINI_BG, fg=MINI_DIM, bd=0, activebackground="#3a3a3a", activeforeground="white")
-        tk.Button(bar, text=" X ", command=app._on_close, **small).pack(side="right")
-        tk.Button(bar, text=" [ ] ", command=app.exit_mini, **small).pack(side="right")
-        self.undo_btn = tk.Button(bar, text=" undo ", command=app.home.undo_save, width=8,
+        ColorButton(bar, text=" X ", command=app._on_close, **small).pack(side="right")
+        ColorButton(bar, text=" [ ] ", command=app.exit_mini, **small).pack(side="right")
+        self.undo_btn = ColorButton(bar, text=" undo ", command=app.home.undo_save, width=8,
                                   disabledforeground="#4a4a4a", **small)
         self.undo_btn.pack(side="right")
 
@@ -1750,7 +1792,7 @@ class MiniWindow(tk.Toplevel):
         for r, states in enumerate(STATE_ROWS):
             for c, st in enumerate(states):
                 btns.columnconfigure(c, weight=1, uniform="state")
-                tk.Button(
+                ColorButton(
                     btns, text=STATE_LABELS[st], bg=STATE_COLORS[st], fg=STATE_FG[st],
                     activebackground=STATE_COLORS[st], activeforeground=STATE_FG[st],
                     font=("", 9, "bold"), bd=0, padx=6, pady=3,

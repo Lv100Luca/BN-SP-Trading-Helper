@@ -60,7 +60,13 @@ def _ensure_dependencies() -> None:
 
 
 def selftest(out: Path) -> int:
-    lines = [f"python {sys.version.split()[0]}  frozen={FROZEN}"]
+    lines = [f"python {sys.version.split()[0]}  frozen={FROZEN}  {sys.platform}"]
+    try:
+        import tkinter
+
+        lines.append(f"tcl/tk {tkinter.Tcl().eval('info patchlevel')}")
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"tkinter unavailable: {exc}")
     code = 0
     try:
         from PIL import Image, ImageDraw
