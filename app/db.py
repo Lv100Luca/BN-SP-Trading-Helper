@@ -93,6 +93,12 @@ CREATE TABLE IF NOT EXISTS pending_uploads (  -- saves waiting to be pushed to t
     kind     TEXT NOT NULL DEFAULT 'seen',    -- seen | edit | note | retract | rename
     new_name TEXT NOT NULL DEFAULT ''         -- rename only
 );
+CREATE TABLE IF NOT EXISTS uploaded_names (   -- what the server has already accepted from us
+    name  TEXT PRIMARY KEY COLLATE NOCASE,
+    ts    TEXT NOT NULL,                      -- UTC ts of the newest change pushed for that name
+    state TEXT NOT NULL DEFAULT '',           -- state last pushed; ts alone misses same-second edits
+    notes TEXT NOT NULL DEFAULT ''            -- the note last pushed, so a later edit is offered again
+);
 """
 
 
@@ -115,6 +121,18 @@ def to_local(ts: str) -> str:
     except ValueError:
         return s
     return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def to_utc(ts: str) -> str:
+    """A local record timestamp as the shared table's UTC '...Z' form; the inverse of to_local."""
+    s = (ts or "").strip()
+    if s.endswith("Z"):
+        return s
+    try:
+        dt = datetime.fromisoformat(s.replace(" ", "T")).astimezone(timezone.utc)
+    except ValueError:
+        return _utc_now()
+    return dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def normalize_name(name: str) -> str:
@@ -553,6 +571,45 @@ class Database:
         self.conn.commit()
         return int(cur.lastrowid), ts
 
+    def backfill_candidates(self) -> list[sqlite3.Row]:
+        """Own records the server has not seen in their current shape: neither waiting in the queue
+        nor pushed under this name with this timestamp and note. What uploads missed while sharing
+        was off, plus anything changed since the last push."""
+        queued = {str(r[0]).lower() for r in self.conn.execute("SELECT name FROM pending_uploads")}
+        done = {str(r["name"]).lower(): r
+                for r in self.conn.execute("SELECT name, ts, state, notes FROM uploaded_names")}
+        rows = self.conn.execute("SELECT name, state, notes, updated_at FROM records ORDER BY updated_at").fetchall()
+        out = []
+        for r in rows:
+            key = r["name"].lower()
+            if key in queued:
+                continue
+            pushed = done.get(key)
+            if (pushed is not None and pushed["ts"] >= to_utc(r["updated_at"])
+                    and pushed["state"] == r["state"]
+                    and normalize_name(pushed["notes"]) == normalize_name(r["notes"])):
+                continue
+            out.append(r)
+        return out
+
+    def backfill_count(self) -> int:
+        return len(self.backfill_candidates())
+
+    def queue_backfill(self) -> int:
+        """Queue every candidate at the time it was last saved, so turning uploads back on shares
+        the whole local table and not only what is saved from now on. A note needs its own row: the
+        server reads notes on "note" rows only. Returns the number of rows queued."""
+        rows = self.backfill_candidates()
+        queued = 0
+        for r in rows:
+            ts = to_utc(r["updated_at"])
+            self.queue_upload(r["name"], r["state"], kind="seen", ts=ts)
+            queued += 1
+            if r["notes"]:
+                self.queue_upload(r["name"], r["state"], r["notes"], kind="note", ts=ts)
+                queued += 1
+        return queued
+
     def delete_upload(self, upload_id: int) -> bool:
         """Drop a queued save that has not been pushed yet. False if it is already gone."""
         cur = self.conn.execute("DELETE FROM pending_uploads WHERE id = ?", (upload_id,))
@@ -571,10 +628,36 @@ class Database:
         return self.conn.execute("SELECT COUNT(*) FROM pending_uploads").fetchone()[0]
 
     def clear_uploads(self, ids: Iterable[int]) -> None:
+        """The server took these rows: remember the names before dropping the rows, otherwise an
+        empty queue looks exactly like a table that was never uploaded and backfill offers it again."""
         ids = list(ids)
-        if ids:
-            self.conn.executemany("DELETE FROM pending_uploads WHERE id = ?", [(i,) for i in ids])
-            self.conn.commit()
+        if not ids:
+            return
+        rows = self.conn.execute(
+            f"SELECT name, new_name, ts, kind, state, notes FROM pending_uploads"
+            f" WHERE id IN ({','.join('?' * len(ids))}) ORDER BY id",
+            ids,
+        ).fetchall()
+        for r in rows:
+            self._mark_uploaded(r["name"], r["new_name"], r["ts"], r["kind"], r["state"], r["notes"])
+        self.conn.executemany("DELETE FROM pending_uploads WHERE id = ?", [(i,) for i in ids])
+        self.conn.commit()
+
+    def _mark_uploaded(self, name: str, new_name: str, ts: str, kind: str, state: str, notes: str) -> None:
+        if kind == "retract":  # the server dropped the entry again, so it counts as never sent
+            self.conn.execute("DELETE FROM uploaded_names WHERE name = ? COLLATE NOCASE", (name,))
+            return
+        if kind == "rename" and new_name:
+            self.conn.execute("DELETE FROM uploaded_names WHERE name = ? COLLATE NOCASE", (name,))
+            name = new_name
+        # Only "note" rows carry a note the server reads; the others must not clear a stored one.
+        note_sql = ", notes = excluded.notes" if kind == "note" else ""
+        self.conn.execute(
+            "INSERT INTO uploaded_names (name, ts, state, notes) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(name) DO UPDATE SET ts = MAX(uploaded_names.ts, excluded.ts), "
+            "state = excluded.state" + note_sql,
+            (normalize_name(name), ts, state, normalize_name(notes) if kind == "note" else ""),
+        )
 
     def touch_global(self) -> None:
         """The server said our copy is still current: only bump the sync time."""

@@ -24,7 +24,7 @@ STATE_COLORS = {"trading": "#2e7d32", "fighting": "#c62828", "afk": "#616161", "
 STATE_FG = {"trading": "white", "fighting": "white", "afk": "white", "fake": "#212121"}  # button text
 STATE_PALE = {"trading": "#e8f5e9", "fighting": "#ffebee", "afk": "#eeeeee", "fake": "#fff8e1"}
 PREVIEW_MAX = (520, 140)
-MIN_SIZE = (640, 520)   # smallest window; also the size on first start (the last size is restored later)
+MIN_SIZE = (640, 640)   # smallest window; also the size on first start (the last size is restored later)
 SAVE_COOLDOWN = 15   # seconds the double click guard ignores clicks for the same name (packaged app)
 
 
@@ -675,7 +675,6 @@ class HomeTab(ttk.Frame):
         # Previous-record panel: headline, one line per source (you / everyone), both notes, both
         # timelines. Nothing one source knows is hidden behind the other.
         self.prev_frame = tk.Frame(self, bd=2, relief="ridge", padx=10, pady=10)
-        self.prev_frame.pack(fill="x", pady=6)
         self.prev_title = tk.Label(self.prev_frame, text="No name read yet", font=("", 13, "bold"), anchor="w")
         self.prev_title.pack(fill="x")
         self.prev_detail = tk.Label(self.prev_frame, text="", justify="left", anchor="w")
@@ -686,18 +685,22 @@ class HomeTab(ttk.Frame):
         self.prev_history = HistoryPanel(self.prev_frame)
         self.prev_history.pack(fill="x", pady=(2, 0))
 
-        ttk.Label(self, text="Record the current state (added to this player's history):").pack(anchor="w", pady=(8, 2))
+        # The record controls are packed bottom-up before the previous-record panel, so a window that
+        # is too short for everything eats into the panel instead of clipping the buttons.
         row = ttk.Frame(self)
-        row.pack(fill="x")
+        row.pack(side="bottom", fill="x", pady=(6, 0))
+        state_row = ttk.Frame(self)
+        state_row.pack(side="bottom", fill="x")
+        ttk.Label(self, text="Record the current state (added to this player's history):").pack(
+            side="bottom", anchor="w", fill="x", pady=(8, 2))
+        self.prev_frame.pack(fill="x", pady=6)
         for st in STATES:
             tk.Button(
-                row, text=STATE_LABELS[st], font=("", 12, "bold"), height=2,
+                state_row, text=STATE_LABELS[st], font=("", 12, "bold"), height=2,
                 bg=STATE_COLORS[st], fg=STATE_FG[st],
                 activebackground=STATE_COLORS[st], activeforeground=STATE_FG[st],
                 command=lambda s=st: self.save_state(s),
             ).pack(side="left", fill="x", expand=True, padx=3)
-        row = ttk.Frame(self)
-        row.pack(fill="x", pady=(6, 0))
         self.cooldown_var = tk.StringVar()
         # fixed button width and a wrapping label, so the countdown never changes the window width
         self.undo_btn = ttk.Button(row, text="Undo last save", command=self.undo_save, state="disabled", width=30)
@@ -1453,6 +1456,8 @@ class SettingsTab(ttk.Frame):
         self.upload_btn.pack(side="right")
         self.discard_btn = ttk.Button(row, text="Discard queued", command=self._discard_queue)
         self.discard_btn.pack(side="right", padx=(0, 6))
+        self.backfill_btn = ttk.Button(row, text="Queue all my records", command=self._offer_backfill)
+        self.backfill_btn.pack(side="right", padx=(0, 6))
         self._rejected = False   # the server answered 401 to an upload this session
         self.refresh_pending_label()
 
@@ -1606,6 +1611,27 @@ class SettingsTab(ttk.Frame):
             self.app.set_status("Enter and save a contributor key first.")
         self.app.db.set_setting("share_uploads", "1" if on else "0")
         self.refresh_pending_label()
+        if on:
+            self._offer_backfill()
+
+    def _offer_backfill(self) -> None:
+        """Nothing is queued while uploads are off, so switching them on would share new saves only.
+        Offer the records saved in the meantime as well."""
+        n = self.app.db.backfill_count()
+        if not n:
+            self.app.set_status("Every record of yours is already queued or uploaded.")
+            return
+        if not messagebox.askyesno(
+                "Upload earlier records too?",
+                f"{n} of your record(s) never reached the global table, for example because "
+                "uploads were off when you saved them, or because they changed after the last upload."
+                "\n\nQueue them now? Names the table already has with "
+                "the same state cost nothing; the server reports them as already known.",
+                parent=self):
+            return
+        queued = self.app.db.queue_backfill()
+        self.refresh_pending_label()
+        self.app.set_status(f"Queued {n} earlier record(s) ({queued} change(s)) for the global table.")
 
     def refresh_pending_label(self) -> None:
         if not hasattr(self, "pending_var"):
@@ -1629,6 +1655,9 @@ class SettingsTab(ttk.Frame):
         self.share_chk.configure(state="normal" if key else "disabled")
         self.upload_btn.configure(state="normal" if (n and self.app.sharing()) else "disabled")
         self.discard_btn.configure(state="normal" if n else "disabled")
+        if hasattr(self, "backfill_btn"):
+            can = self.app.sharing() and self.app.db.backfill_count() > 0
+            self.backfill_btn.configure(state="normal" if can else "disabled")
 
     def set_upload_enabled(self, on: bool) -> None:
         if hasattr(self, "upload_btn"):

@@ -8,6 +8,9 @@ create releases, re-run or edit CI workflows, change remotes. Just do it and rep
 
 Conventions:
 - Bump `__version__` in `app/__init__.py` before tagging a release (`vX.Y.Z` triggers the release workflow).
+- Keep the new version close to the newest tag. Check `git tag --sort=-v:refname | head -1` first.
+  Allowed: same minor with a higher patch, or the next minor at `.0`. If the latest release is 1.0.2,
+  never go past 1.1.x. Never jump a major. Anything further needs explicit approval.
 - Keep commit messages descriptive; the first line is what shows in the release notes.
 
 ## Project notes
